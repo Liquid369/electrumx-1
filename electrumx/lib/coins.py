@@ -2765,6 +2765,48 @@ class Pivx(Coin):
             import quark_hash
             return quark_hash.getPoWHash(header)
 
+class DogeCash(Coin):
+    NAME = "DogeCash"
+    SHORTNAME = "DOGEC"
+    NET = "mainnet"
+    XPUB_VERBYTES = bytes.fromhex("022D2533")
+    XPRV_VERBYTES = bytes.fromhex("0221312B")
+    GENESIS_HASH = '0000093cfce0a5a3cecea522e2c13bdf055d65c559fd2222730ba6f0d18dd2cd'
+    P2PKH_VERBYTE = bytes.fromhex("1e")
+    P2SH_VERBYTE = bytes.fromhex("13")
+    WIF_BYTE = bytes.fromhex("7a")
+    DESERIALIZER = lib_tx.DeserializerPIVX
+    TX_COUNT_HEIGHT = 569399 #needs updating
+    TX_COUNT = 2157510 #needs updating still
+    TX_PER_BLOCK = 1
+    STATIC_BLOCK_HEADERS = False
+    RPC_PORT = 56470
+    REORG_LIMIT = 100
+    EXPANDED_HEADER = 112
+    ZEROCOIN_START_HEIGHT = 1
+    ZEROCOIN_END_HEIGHT = 575000
+    ZEROCOIN_BLOCK_VERSION = 4
+    SAPLING_START_HEIGHT = 1122000
+
+    @classmethod
+    def static_header_len(cls, height):
+        '''Given a header height return its length.'''
+        if (height >= cls.ZEROCOIN_START_HEIGHT and height < cls.ZEROCOIN_END_HEIGHT) \
+                or (height >= cls.SAPLING_START_HEIGHT):
+            return cls.EXPANDED_HEADER
+        else:
+            return cls.BASIC_HEADER_SIZE
+
+    @classmethod
+    def header_hash(cls, header):
+        '''Given a header return the hash.'''
+        version, = struct.unpack('<I', header[:4])
+        if version >= cls.ZEROCOIN_BLOCK_VERSION:
+            return super().header_hash(header)
+        else:
+            import quark_hash
+            return quark_hash.getPoWHash(header)
+
 
 class PivxTestnet(Pivx):
     NET = "testnet"
