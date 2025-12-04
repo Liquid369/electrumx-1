@@ -871,3 +871,93 @@ class LTORBlockProcessor(BlockProcessor):
                 add_touched(hashX)
 
         self.tx_count -= len(txs)
+
+
+class PIVXSaplingBlockProcessor(BlockProcessor):
+    '''Block processor for PIVX with Sapling shielded transaction support.
+
+    Indexes nullifiers, commitments, and anchors for light wallet queries.
+    '''
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Sapling data caches for flushing
+        self.sapling_nullifiers = []  # (nullifier, tx_hash, height)
+        self.sapling_commitments = []  # (commitment, tx_hash, idx, height)
+        self.sapling_anchors = []  # (anchor, height)
+        # For backup/reorg
+        self.sapling_undo_nullifiers = []
+        self.sapling_undo_commitments = []
+        self.sapling_undo_anchors = []
+
+    def flush_data(self):
+        '''Override to include Sapling data in flush.'''
+        flush_data = super().flush_data()
+        # Add Sapling data to flush
+        flush_data.sapling_nullifiers = self.sapling_nullifiers[:]
+        flush_data.sapling_commitments = self.sapling_commitments[:]
+        flush_data.sapling_anchors = self.sapling_anchors[:]
+        # Clear our caches after copying
+        self.sapling_nullifiers.clear()
+        self.sapling_commitments.clear()
+        self.sapling_anchors.clear()
+        return flush_data
+
+    def advance_txs(
+            self,
+            txs: Sequence[Tx],
+            is_unspendable: Callable[[bytes], bool],
+    ) -> Sequence[bytes]:
+        '''Process transactions, including Sapling shielded data.'''
+        # Import here to avoid circular dependency
+        from electrumx.lib.tx import TxPIVXSapling
+
+        # Call parent to handle transparent inputs/outputs
+        undo_info = super().advance_txs(txs, is_unspendable)
+
+        # Extract Sapling data from transactions
+        height = self.height
+        seen_anchors = set()  # Dedupe anchors within block
+
+        for tx in txs:
+            if isinstance(tx, TxPIVXSapling):
+                tx_hash = tx.txid
+
+                # Index nullifiers from spends
+                for spend in tx.sapling_spends:
+                    self.sapling_nullifiers.append(
+                        (spend.nullifier, tx_hash, height)
+                    )
+                    # Track unique anchors
+                    if spend.anchor not in seen_anchors:
+                        seen_anchors.add(spend.anchor)
+                        self.sapling_anchors.append((spend.anchor, height))
+
+                # Index commitments from outputs
+                for idx, output in enumerate(tx.sapling_outputs):
+                    self.sapling_commitments.append(
+                        (output.cmu, tx_hash, idx, height)
+                    )
+
+        return undo_info
+
+    def backup_txs(
+            self,
+            txs: Sequence[Tx],
+            is_unspendable: Callable[[bytes], bool],
+    ):
+        '''Backup transactions during reorg, including Sapling data.'''
+        from electrumx.lib.tx import TxPIVXSapling
+
+        # Collect Sapling data to remove
+        for tx in txs:
+            if isinstance(tx, TxPIVXSapling):
+                for spend in tx.sapling_spends:
+                    self.sapling_undo_nullifiers.append(spend.nullifier)
+                    self.sapling_undo_anchors.append(spend.anchor)
+
+                for output in tx.sapling_outputs:
+                    self.sapling_undo_commitments.append(output.cmu)
+
+        # Call parent backup
+        super().backup_txs(txs, is_unspendable)
