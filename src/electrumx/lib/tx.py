@@ -535,6 +535,28 @@ class DeserializerZcash(DeserializerEquihash):
 
 
 @dataclass(kw_only=True, slots=True)
+class SaplingSpend:
+    '''Class representing a PIVX Sapling spend.'''
+    cv: bytes           # 32 bytes - value commitment
+    anchor: bytes       # 32 bytes - Merkle tree root
+    nullifier: bytes    # 32 bytes - spent note identifier
+    rk: bytes           # 32 bytes - randomized public key
+    zkproof: bytes      # 192 bytes - Groth16 proof
+    spend_auth_sig: bytes  # 64 bytes - signature
+
+
+@dataclass(kw_only=True, slots=True)
+class SaplingOutput:
+    '''Class representing a PIVX Sapling output.'''
+    cv: bytes           # 32 bytes - value commitment
+    cmu: bytes          # 32 bytes - note commitment (indexed)
+    ephemeral_key: bytes  # 32 bytes
+    enc_ciphertext: bytes  # 580 bytes
+    out_ciphertext: bytes  # 80 bytes
+    zkproof: bytes      # 192 bytes
+
+
+@dataclass(kw_only=True, slots=True)
 class TxPIVX(Tx):
     '''Class representing a PIVX transaction.'''
     txtype: int
@@ -551,7 +573,44 @@ class TxPIVX(Tx):
         ))
 
 
+@dataclass(kw_only=True, slots=True)
+class TxPIVXSapling(TxPIVX):
+    '''Class representing a PIVX Sapling transaction with shielded data.'''
+    value_balance: int  # 8 bytes - net value of shielded section
+    sapling_spends: Sequence[SaplingSpend]
+    sapling_outputs: Sequence[SaplingOutput]
+    binding_sig: bytes  # 64 bytes
+
+
 class DeserializerPIVX(Deserializer):
+    '''Deserializer for PIVX transactions including Sapling shielded transactions.'''
+
+    # Sapling component sizes
+    SAPLING_SPEND_SIZE = 384  # 32+32+32+32+192+64
+    SAPLING_OUTPUT_SIZE = 948  # 32+32+32+580+80+192
+
+    def _read_sapling_spend(self) -> SaplingSpend:
+        '''Read a single Sapling spend (384 bytes).'''
+        return SaplingSpend(
+            cv=self._read_nbytes(32),
+            anchor=self._read_nbytes(32),
+            nullifier=self._read_nbytes(32),
+            rk=self._read_nbytes(32),
+            zkproof=self._read_nbytes(192),
+            spend_auth_sig=self._read_nbytes(64),
+        )
+
+    def _read_sapling_output(self) -> SaplingOutput:
+        '''Read a single Sapling output (948 bytes).'''
+        return SaplingOutput(
+            cv=self._read_nbytes(32),
+            cmu=self._read_nbytes(32),
+            ephemeral_key=self._read_nbytes(32),
+            enc_ciphertext=self._read_nbytes(580),
+            out_ciphertext=self._read_nbytes(80),
+            zkproof=self._read_nbytes(192),
+        )
+
     def read_tx(self):
         orig_start = self.cursor
         start = self.cursor
@@ -566,29 +625,58 @@ class DeserializerPIVX(Deserializer):
             version = header
             tx_type = 0
 
-        base_tx = TxPIVX(
-            version=version,
-            txtype=tx_type,
-            inputs=self._read_inputs(),
-            outputs=self._read_outputs(),
-            locktime=self._read_le_uint32(),
-            txid=None,
-            wtxid=None,
-        )
+        inputs = self._read_inputs()
+        outputs = self._read_outputs()
+        locktime = self._read_le_uint32()
 
         if version >= 3:  # >= sapling
-            self._read_varint()
-            self.cursor += 8  # valueBalance
-            shielded_spend_size = self._read_varint()
-            self.cursor += shielded_spend_size * 384  # vShieldedSpend
-            shielded_output_size = self._read_varint()
-            self.cursor += shielded_output_size * 948  # vShieldedOutput
-            self.cursor += 64  # bindingSig
-            if (tx_type > 0):
+            self._read_varint()  # nExpiryHeight (unused)
+            value_balance = self._read_le_int64()
+
+            # Read Sapling spends
+            shielded_spend_count = self._read_varint()
+            sapling_spends = [self._read_sapling_spend()
+                              for _ in range(shielded_spend_count)]
+
+            # Read Sapling outputs
+            shielded_output_count = self._read_varint()
+            sapling_outputs = [self._read_sapling_output()
+                               for _ in range(shielded_output_count)]
+
+            # Read binding signature (always present for v3+)
+            binding_sig = self._read_nbytes(64)
+
+            if tx_type > 0:
                 self.cursor += 2  # extraPayload
 
-        base_tx.txid = base_tx.wtxid = self.TX_HASH_FN(self.binary[orig_start:self.cursor])
-        return base_tx
+            txid = self.TX_HASH_FN(self.binary[orig_start:self.cursor])
+
+            # Return TxPIVXSapling if there's shielded data, otherwise TxPIVX
+            if sapling_spends or sapling_outputs:
+                return TxPIVXSapling(
+                    version=version,
+                    txtype=tx_type,
+                    inputs=inputs,
+                    outputs=outputs,
+                    locktime=locktime,
+                    txid=txid,
+                    wtxid=txid,
+                    value_balance=value_balance,
+                    sapling_spends=sapling_spends,
+                    sapling_outputs=sapling_outputs,
+                    binding_sig=binding_sig,
+                )
+
+        txid = self.TX_HASH_FN(self.binary[orig_start:self.cursor])
+        return TxPIVX(
+            version=version,
+            txtype=tx_type,
+            inputs=inputs,
+            outputs=outputs,
+            locktime=locktime,
+            txid=txid,
+            wtxid=txid,
+        )
 
 
 @dataclass(kw_only=True, slots=True)
