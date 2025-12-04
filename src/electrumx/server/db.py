@@ -26,7 +26,7 @@ from electrumx.lib.hash import hash_to_hex_str, HASHX_LEN
 from electrumx.lib.merkle import Merkle, MerkleCache
 from electrumx.lib.util import (
     formatted_time, pack_be_uint16, pack_be_uint32, pack_le_uint64, pack_le_uint32,
-    unpack_le_uint32, unpack_be_uint32, unpack_le_uint64
+    unpack_le_uint32, unpack_be_uint32, unpack_le_uint64, unpack_be_uint16_from
 )
 from electrumx.server.storage import db_class, Storage
 from electrumx.server.history import History, TXNUM_LEN
@@ -55,6 +55,10 @@ class FlushData:
     adds = attr.ib()  # type: Dict[bytes, bytes]  # txid+out_idx -> hashX+tx_num+value_sats
     deletes = attr.ib()  # type: List[bytes]  # b'h' db keys, and b'u' db keys
     tip = attr.ib()
+    # PIVX Sapling data (optional, defaults to empty lists)
+    sapling_nullifiers = attr.ib(factory=list)  # (nullifier, tx_hash, height)
+    sapling_commitments = attr.ib(factory=list)  # (cmu, tx_hash, idx, height)
+    sapling_anchors = attr.ib(factory=list)  # (anchor, height)
 
 
 COMP_TXID_LEN = 4
@@ -343,6 +347,21 @@ class DB:
         self.flush_undo_infos(batch_put, flush_data.undo_infos)
         flush_data.undo_infos.clear()
 
+        # Flush Sapling data (PIVX)
+        sapling_count = (len(flush_data.sapling_nullifiers) +
+                         len(flush_data.sapling_commitments) +
+                         len(flush_data.sapling_anchors))
+        if sapling_count > 0:
+            self.flush_sapling_data(
+                batch,
+                flush_data.sapling_nullifiers,
+                flush_data.sapling_commitments,
+                flush_data.sapling_anchors,
+            )
+            flush_data.sapling_nullifiers.clear()
+            flush_data.sapling_commitments.clear()
+            flush_data.sapling_anchors.clear()
+
         if self.utxo_db.for_sync:
             block_count = flush_data.height - self.db_height
             tx_count = flush_data.tx_count - self.db_tx_count
@@ -351,6 +370,8 @@ class DB:
                              f'{tx_count:,d} txs, {add_count:,d} UTXO adds, '
                              f'{spend_count:,d} spends in '
                              f'{elapsed:.1f}s, committing...')
+            if sapling_count > 0:
+                self.logger.info(f'flushed {sapling_count:,d} Sapling items')
 
         self.utxo_flush_count = self.history.flush_count
         self.db_height = flush_data.height
@@ -820,3 +841,114 @@ class DB:
 
         hashX_pairs = await run_in_thread(lookup_hashXs)
         return await run_in_thread(lookup_utxos, hashX_pairs)
+
+    # -- PIVX Sapling support
+    # Key prefixes:
+    # 'N' + nullifier (32 bytes) -> txhash (32) + height (4)
+    # 'C' + commitment (32 bytes) -> txhash (32) + output_index (2) + height (4)
+    # 'A' + anchor (32 bytes) -> height (4)
+
+    def flush_sapling_data(
+            self,
+            batch,
+            nullifiers: List[Tuple[bytes, bytes, int]],
+            commitments: List[Tuple[bytes, bytes, int, int]],
+            anchors: List[Tuple[bytes, int]],
+    ):
+        '''Flush Sapling nullifiers, commitments, and anchors to the DB.
+
+        nullifiers: list of (nullifier, tx_hash, height)
+        commitments: list of (commitment, tx_hash, output_index, height)
+        anchors: list of (anchor, height)
+        '''
+        batch_put = batch.put
+
+        # Write nullifiers
+        # Key: b'N' + nullifier (32 bytes)
+        # Value: tx_hash (32 bytes) + height (4 bytes)
+        for nullifier, tx_hash, height in nullifiers:
+            key = b'N' + nullifier
+            value = tx_hash + pack_be_uint32(height)
+            batch_put(key, value)
+
+        # Write commitments
+        # Key: b'C' + commitment (32 bytes)
+        # Value: tx_hash (32 bytes) + output_index (2 bytes) + height (4 bytes)
+        for commitment, tx_hash, output_index, height in commitments:
+            key = b'C' + commitment
+            value = tx_hash + pack_be_uint16(output_index) + pack_be_uint32(height)
+            batch_put(key, value)
+
+        # Write anchors
+        # Key: b'A' + anchor (32 bytes)
+        # Value: height (4 bytes)
+        for anchor, height in anchors:
+            key = b'A' + anchor
+            value = pack_be_uint32(height)
+            batch_put(key, value)
+
+    def backup_sapling_data(
+            self,
+            batch,
+            nullifiers: List[bytes],
+            commitments: List[bytes],
+            anchors: List[bytes],
+    ):
+        '''Remove Sapling data during reorg/backup.
+
+        nullifiers: list of nullifier bytes to remove
+        commitments: list of commitment bytes to remove
+        anchors: list of anchor bytes to remove
+        '''
+        batch_delete = batch.delete
+
+        for nullifier in nullifiers:
+            batch_delete(b'N' + nullifier)
+
+        for commitment in commitments:
+            batch_delete(b'C' + commitment)
+
+        for anchor in anchors:
+            batch_delete(b'A' + anchor)
+
+    def get_nullifier_spend(self, nullifier: bytes) -> Optional[Tuple[bytes, int]]:
+        '''Get the tx_hash and height where a nullifier was spent.
+
+        Returns (tx_hash, height) or None if not found.
+        '''
+        key = b'N' + nullifier
+        value = self.utxo_db.get(key)
+        if value is None:
+            return None
+        tx_hash = value[:32]
+        height, = unpack_be_uint32(value[32:36])
+        return tx_hash, height
+
+    def get_commitment_info(
+            self, commitment: bytes
+    ) -> Optional[Tuple[bytes, int, int]]:
+        '''Get info about a commitment (cmu).
+
+        Returns (tx_hash, output_index, height) or None if not found.
+        '''
+        key = b'C' + commitment
+        value = self.utxo_db.get(key)
+        if value is None:
+            return None
+        tx_hash = value[:32]
+        output_index, = unpack_be_uint16_from(value, 32)
+        height, = unpack_be_uint32(value[34:38])
+        return tx_hash, output_index, height
+
+    def get_anchor_height(self, anchor: bytes) -> Optional[int]:
+        '''Get the height at which an anchor was valid.
+
+        Returns height or None if not found.
+        '''
+        key = b'A' + anchor
+        value = self.utxo_db.get(key)
+        if value is None:
+            return None
+        height, = unpack_be_uint32(value)
+        return height
+
