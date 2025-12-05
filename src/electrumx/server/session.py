@@ -2220,9 +2220,10 @@ class PIVXSaplingElectrumX(ElectrumX):
         '''Get compact block data for a height range (Zcash lightwalletd compatible).
 
         Returns blocks with Sapling outputs for trial decryption.
-        Each block contains: height, hash, and list of compact transactions.
-        Each transaction contains: txid and list of outputs.
-        Each output contains: cmu, epk, enc_ciphertext.
+        Each block contains: height, hash, time, and list of compact transactions.
+        Each transaction contains: txid, outputs, and spends.
+        Each output contains: cmu, epk, ciphertext, cv, out_ciphertext.
+        Each spend contains: nullifier, cv, anchor, rk.
 
         start_height: starting block height (inclusive)
         end_height: ending block height (inclusive)
@@ -2237,39 +2238,40 @@ class PIVXSaplingElectrumX(ElectrumX):
         if end_height < start_height:
             raise RPCError(BAD_REQUEST, 'end_height must be >= start_height')
 
-        max_blocks = 1000
-        if end_height - start_height > max_blocks:
+        max_blocks = 100  # Reduced for performance
+        block_count = end_height - start_height + 1
+        if block_count > max_blocks:
             raise RPCError(
                 BAD_REQUEST,
                 f'range too large, max {max_blocks} blocks'
             )
 
         # Cost based on range size
-        self.bump_cost(2.0 + (end_height - start_height) * 0.2)
+        self.bump_cost(2.0 + block_count * 0.5)
 
         blocks = []
 
         try:
-            for height in range(start_height, end_height + 1):
-                # Get block hash at height
-                try:
-                    block_hash = await self.daemon_request('getblockhash', height)
-                except DaemonError:
-                    break  # Height doesn't exist yet
+            # Get block hashes for the range using proper daemon API
+            block_hashes = await self.session_mgr.daemon.block_hex_hashes(
+                start_height, block_count
+            )
 
-                # Get full block
-                try:
-                    block_hex = await self.daemon_request(
-                        'getblock', block_hash, 0
-                    )
-                except DaemonError:
-                    continue
+            if not block_hashes:
+                return blocks
 
-                block_data = bytes.fromhex(block_hex)
+            # Get raw blocks using proper daemon API
+            raw_blocks = await self.session_mgr.daemon.raw_blocks(block_hashes)
+
+            # Process each block
+            for i, (block_hash, block_data) in enumerate(
+                zip(block_hashes, raw_blocks)
+            ):
+                height = start_height + i
                 header_size = self.coin.header_len(height)
 
                 # Extract timestamp from header (at offset 68, 4 bytes LE)
-                # Standard header: version(4) + prev_hash(32) + merkle(32) + time(4)
+                # Header: version(4) + prev_hash(32) + merkle(32) + time(4)
                 block_time = int.from_bytes(block_data[68:72], 'little')
 
                 # Deserialize transactions
@@ -2311,15 +2313,17 @@ class PIVXSaplingElectrumX(ElectrumX):
                             'spends': compact_spends,
                         })
 
-                # Always include block even if no Sapling txs (for sync continuity)
+                # Always include block even if no Sapling txs
                 blocks.append({
                     'height': height,
                     'hash': block_hash,
                     'time': block_time,
                     'txs': compact_txs,
                 })
+
+        except DaemonError as e:
+            self.logger.error(f'get_block_range daemon error: {e}')
         except Exception as e:
-            # Log error but still return whatever blocks we got
             self.logger.error(f'get_block_range error: {e}')
 
         return blocks
