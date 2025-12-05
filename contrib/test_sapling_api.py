@@ -4,11 +4,42 @@ Test script for PIVX Sapling ElectrumX API endpoints.
 
 Tests the Cake Wallet compatible APIs:
 - blockchain.sapling.get_outputs (RECEIVING - trial decryption)
-- blockchain.sapling.get_block_range (RECEIVING - compact blocks)
+- blockchain.sapling.get_block_range (RECEIVING - compact blocks, lightwalletd)
 - blockchain.sapling.get_witness (SENDING - spend proof)
 - blockchain.sapling.get_nullifiers (SYNC)
 - blockchain.sapling.get_tree_state (SYNC)
 - blockchain.nullifier.get_spend (SYNC)
+
+get_block_range response format (Zcash lightwalletd compatible):
+    [
+        {
+            'height': int,
+            'hash': str (hex),
+            'time': int (unix timestamp),
+            'txs': [
+                {
+                    'txid': str (hex),
+                    'outputs': [
+                        {
+                            'cmu': str,          # note commitment
+                            'epk': str,          # ephemeral public key
+                            'ciphertext': str,   # encrypted ciphertext (580 bytes)
+                            'cv': str,           # value commitment
+                            'out_ciphertext': str  # outgoing ciphertext (80 bytes)
+                        }
+                    ],
+                    'spends': [
+                        {
+                            'nullifier': str,    # spent note identifier
+                            'cv': str,           # value commitment
+                            'anchor': str,       # Merkle tree root
+                            'rk': str            # randomized public key
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
 
 Usage:
     python test_sapling_api.py [host] [port] [--ssl]
@@ -242,7 +273,7 @@ def test_api(host: str, port: int, use_ssl: bool = False):
         print(f"  ✗ Exception: {e}")
         all_passed = False
 
-    # Test 7: blockchain.sapling.get_block_range (SYNC - Zcash lightwalletd compatible)
+    # Test 7: blockchain.sapling.get_block_range (Zcash lightwalletd compatible)
     print("\nTest 7: blockchain.sapling.get_block_range (SYNC)")
     print(f"  Range: {TEST_HEIGHT} to {TEST_HEIGHT}")
     try:
@@ -258,12 +289,23 @@ def test_api(host: str, port: int, use_ssl: bool = False):
                     print(f"    - height: {blk.get('height')}")
                     blk_hash = blk.get('hash', 'N/A')
                     print(f"      hash: {blk_hash[:16]}...")
+                    print(f"      time: {blk.get('time')}")
                     txs = blk.get('txs', [])
                     print(f"      txs: {len(txs)}")
                     for tx in txs[:1]:
                         print(f"        txid: {tx.get('txid', 'N/A')[:16]}...")
                         outputs = tx.get('outputs', [])
-                        print(f"        outputs: {len(outputs)}")
+                        spends = tx.get('spends', [])
+                        print(f"        outputs: {len(outputs)}, spends: {len(spends)}")
+                        if outputs:
+                            out = outputs[0]
+                            print(f"          cmu: {out.get('cmu', '')[:16]}...")
+                            print(f"          cv: {out.get('cv', '')[:16]}...")
+                            print(f"          out_ciphertext present: "
+                                  f"{'out_ciphertext' in out}")
+                        if spends:
+                            sp = spends[0]
+                            print(f"          nullifier: {sp.get('nullifier', '')[:16]}...")
             else:
                 print(f"  ✗ Expected list, got: {type(r)}")
                 all_passed = False

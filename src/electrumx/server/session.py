@@ -2267,6 +2267,10 @@ class PIVXSaplingElectrumX(ElectrumX):
             block_data = bytes.fromhex(block_hex)
             header_size = self.coin.header_len(height)
 
+            # Extract timestamp from header (at offset 68, 4 bytes LE)
+            # Bitcoin header: version(4) + prev_hash(32) + merkle(32) + time(4)
+            block_time = int.from_bytes(block_data[68:72], 'little')
+
             # Deserialize transactions
             deserializer = self.coin.DESERIALIZER(
                 block_data, start=header_size
@@ -2276,23 +2280,41 @@ class PIVXSaplingElectrumX(ElectrumX):
             compact_txs = []
             for _ in range(tx_count):
                 tx = deserializer.read_tx()
-                if isinstance(tx, TxPIVXSapling) and tx.sapling_outputs:
+                if isinstance(tx, TxPIVXSapling) and (
+                    tx.sapling_outputs or tx.sapling_spends
+                ):
+                    # Compact outputs (for receiving)
                     compact_outputs = []
                     for output in tx.sapling_outputs:
                         compact_outputs.append({
                             'cmu': output.cmu.hex(),
                             'epk': output.ephemeral_key.hex(),
                             'ciphertext': output.enc_ciphertext.hex(),
+                            'cv': output.cv.hex(),
+                            'out_ciphertext': output.out_ciphertext.hex(),
                         })
+
+                    # Compact spends/nullifiers (for sync)
+                    compact_spends = []
+                    for spend in tx.sapling_spends:
+                        compact_spends.append({
+                            'nullifier': spend.nullifier.hex(),
+                            'cv': spend.cv.hex(),
+                            'anchor': spend.anchor.hex(),
+                            'rk': spend.rk.hex(),
+                        })
+
                     compact_txs.append({
                         'txid': tx.txid.hex(),
                         'outputs': compact_outputs,
+                        'spends': compact_spends,
                     })
 
             # Always include block even if no Sapling txs (for sync continuity)
             blocks.append({
                 'height': height,
                 'hash': block_hash,
+                'time': block_time,
                 'txs': compact_txs,
             })
 
