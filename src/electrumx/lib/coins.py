@@ -50,7 +50,8 @@ import electrumx.server.block_processor as block_proc
 import electrumx.server.daemon as daemon
 from electrumx.server.session import (ElectrumX, DashElectrumX,
                                       SmartCashElectrumX, AuxPoWElectrumX,
-                                      NameIndexElectrumX, NameIndexAuxPoWElectrumX)
+                                      NameIndexElectrumX, NameIndexAuxPoWElectrumX,
+                                      PIVXSaplingElectrumX)
 
 
 @dataclass(slots=True)
@@ -2897,11 +2898,14 @@ class Pivx(Coin):
     NET = "mainnet"
     XPUB_VERBYTES = bytes.fromhex("022D2533")
     XPRV_VERBYTES = bytes.fromhex("0221312B")
-    GENESIS_HASH = '0000041e482b9b9691d98eefb48473405c0b8ec31b76df3797c74a78680ef818'
+    GENESIS_HASH = ('0000041e482b9b9691d98eefb48473405c0b8ec31b76df3'
+                    '797c74a78680ef818')
     P2PKH_VERBYTE = bytes.fromhex("1e")
     P2SH_VERBYTE = bytes.fromhex("0d")
     WIF_BYTE = bytes.fromhex("d4")
     DESERIALIZER = lib_tx.DeserializerPIVX
+    SESSIONCLS = PIVXSaplingElectrumX
+    BLOCK_PROCESSOR = block_proc.PIVXSaplingBlockProcessor
     TX_COUNT_HEIGHT = 569399
     TX_COUNT = 2157510
     TX_PER_BLOCK = 1
@@ -2917,7 +2921,8 @@ class Pivx(Coin):
     @classmethod
     def static_header_len(cls, height):
         '''Given a header height return its length.'''
-        if (height >= cls.ZEROCOIN_START_HEIGHT and height < cls.ZEROCOIN_END_HEIGHT) \
+        if (height >= cls.ZEROCOIN_START_HEIGHT
+                and height < cls.ZEROCOIN_END_HEIGHT) \
                 or (height >= cls.SAPLING_START_HEIGHT):
             return cls.EXPANDED_HEADER
         else:
@@ -2938,7 +2943,8 @@ class PivxTestnet(Pivx):
     NET = "testnet"
     XPUB_VERBYTES = bytes.fromhex("3a8061a0")
     XPRV_VERBYTES = bytes.fromhex("3a805837")
-    GENESIS_HASH = '0000041e482b9b9691d98eefb48473405c0b8ec31b76df3797c74a78680ef818'
+    GENESIS_HASH = ('0000041e482b9b9691d98eefb48473405c0b8ec31b76df3'
+                    '797c74a78680ef818')
     P2PKH_VERBYTE = bytes.fromhex("8B")
     P2SH_VERBYTE = bytes.fromhex("13")
     WIF_BYTE = bytes.fromhex("EF")
@@ -2952,8 +2958,9 @@ class PivxTestnet(Pivx):
     @classmethod
     def static_header_len(cls, height):
         '''Given a header height return its length.'''
-        if (height >= cls.ZEROCOIN_START_HEIGHT and height < cls.ZEROCOIN_END_HEIGHT) or (
-                height >= cls.SAPLING_START_HEIGHT):
+        if (height >= cls.ZEROCOIN_START_HEIGHT
+                and height < cls.ZEROCOIN_END_HEIGHT) \
+                or (height >= cls.SAPLING_START_HEIGHT):
             return cls.EXPANDED_HEADER
         else:
             return cls.BASIC_HEADER_SIZE
