@@ -2108,6 +2108,11 @@ class PIVXSaplingElectrumX(ElectrumX):
             # Zcash lightwalletd compatible methods
             'blockchain.sapling.get_block_range':
                 self.sapling_get_block_range,
+            # Alias without blockchain prefix for compatibility
+            'get_block_range':
+                self.sapling_get_block_range,
+            'sapling.get_block_range':
+                self.sapling_get_block_range,
             # Additional utility methods
             'blockchain.commitment.get_info':
                 self.commitment_get_info,
@@ -2232,7 +2237,7 @@ class PIVXSaplingElectrumX(ElectrumX):
         if end_height < start_height:
             raise RPCError(BAD_REQUEST, 'end_height must be >= start_height')
 
-        max_blocks = 100  # Reduced for performance
+        max_blocks = 1000  # Allow larger batches for faster sync
         block_count = end_height - start_height + 1
         if block_count > max_blocks:
             raise RPCError(
@@ -2241,7 +2246,7 @@ class PIVXSaplingElectrumX(ElectrumX):
             )
 
         # Cost based on range size
-        self.bump_cost(2.0 + block_count * 0.5)
+        self.bump_cost(2.0 + block_count * 0.1)
 
         blocks = []
 
