@@ -64,6 +64,7 @@ Documentation
    peer_discovery
    rpc-interface
    architecture
+   pivx-sapling
    authors
 
 Indices and tables
