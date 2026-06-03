@@ -1,15 +1,20 @@
 import asyncio
+from collections import defaultdict
 import json
 import logging
 from pathlib import Path
 from unittest import mock
 
+from aiorpcx import Request
+
 from electrumx.lib.coins import Pivx, PivxTestnet
 from electrumx.lib import tx as tx_lib
+from electrumx.server.daemon import DaemonError
 from electrumx.server.db import DB
 from electrumx.server.session import (
     PIVXSaplingElectrumX,
     PIVX_SAPLING_MAX_BLOCK_RANGE,
+    PIVX_SAPLING_RPC_CONTRACT,
 )
 
 
@@ -17,6 +22,7 @@ class FakeKV:
 
     def __init__(self):
         self.data = {}
+        self.for_sync = False
 
     def get(self, key):
         return self.data.get(key)
@@ -58,6 +64,22 @@ def test_pivx_sapling_rollback_policy_and_activation_heights():
     assert Pivx.REORG_LIMIT >= 100
     assert Pivx.SAPLING_START_HEIGHT == 2700500
     assert PivxTestnet.SAPLING_START_HEIGHT == 201
+
+
+def test_client_rescan_start_covers_full_rollback_window_from_activation():
+    def rescan_start(last_scanned_height):
+        return max(
+            Pivx.SAPLING_START_HEIGHT,
+            last_scanned_height - Pivx.REORG_LIMIT + 1,
+        )
+
+    assert rescan_start(Pivx.SAPLING_START_HEIGHT) == Pivx.SAPLING_START_HEIGHT
+    assert rescan_start(Pivx.SAPLING_START_HEIGHT + 99) == Pivx.SAPLING_START_HEIGHT
+    assert rescan_start(Pivx.SAPLING_START_HEIGHT + 100) == (
+        Pivx.SAPLING_START_HEIGHT + 1
+    )
+    assert (Pivx.SAPLING_START_HEIGHT + 100
+            - rescan_start(Pivx.SAPLING_START_HEIGHT + 100) + 1) == Pivx.REORG_LIMIT
 
 
 def test_sapling_reorg_removes_outputs_spends_anchors_roots_and_positions():
@@ -176,6 +198,7 @@ def make_session(db, daemon):
     session.db = db
     session.session_mgr = mock.Mock()
     session.session_mgr.daemon = daemon
+    session.session_mgr._method_counts = defaultdict(int)
     session.logger = logging.getLogger('test-pivx-sapling')
     session.bump_cost = lambda _cost: None
     return session
@@ -208,6 +231,145 @@ def test_client_can_rescan_full_pivx_rollback_boundary_with_hashes():
         if stale_local_hashes[item['height']] != item['block_hash']
     ]
     assert mismatches == [block['height']]
+
+
+def test_sapling_capabilities_document_cake_wallet_v1_contract():
+    session = make_session(make_sapling_db(), FixtureDaemon([]))
+
+    capabilities = session.sapling_capabilities()
+
+    assert capabilities['success'] is True
+    assert capabilities['contract'] == PIVX_SAPLING_RPC_CONTRACT
+    assert capabilities['version'] == 1
+    assert capabilities['range_response'] == 'envelope'
+    assert 'unsupported_method' in capabilities['range_error_types']
+    for method in (
+            'blockchain.sapling.capabilities',
+            'blockchain.sapling.get_block_range',
+            'blockchain.sapling.get_nullifier_status',
+            'blockchain.sapling.get_commitment_info',
+            'blockchain.sapling.get_best_anchor',
+            'blockchain.sapling.get_anchor_height',
+            'blockchain.sapling.get_tree_state',
+            'blockchain.sapling.get_witness'):
+        assert method in capabilities['methods']
+    assert 'get_block_range' in capabilities['aliases'][
+        'blockchain.sapling.get_block_range']
+
+
+def test_sapling_unknown_contract_method_returns_structured_error():
+    session = make_session(make_sapling_db(), FixtureDaemon([]))
+    session.request_handlers = {}
+
+    response = run(session.handle_request(
+        Request('blockchain.sapling.future_method', [])))
+
+    assert response['success'] is False
+    assert response['contract'] == PIVX_SAPLING_RPC_CONTRACT
+    assert response['method'] == 'blockchain.sapling.future_method'
+    assert response['error']['type'] == 'unsupported_method'
+    assert 'blockchain.sapling.get_block_range' in response['supported_methods']
+
+
+def test_get_block_range_success_empty_scanned_range_is_complete():
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db()
+    session = make_session(db, FixtureDaemon([block]))
+
+    response = run(session.sapling_get_block_range(
+        block['height'], block['height']))
+
+    assert response['success'] is True
+    assert response['complete'] is True
+    assert response['empty'] is True
+    assert response['height_count'] == 1
+    assert response['block_count'] == 0
+    assert response['sapling_tx_count'] == 0
+    assert response['block_hashes'] == [
+        {'height': block['height'], 'block_hash': block['hash']}
+    ]
+    assert response['blocks'] == []
+    assert response['error'] is None
+
+
+class FailingDaemon:
+
+    async def block_hex_hashes(self, start_height, count):
+        raise DaemonError('daemon unavailable')
+
+
+def test_get_block_range_daemon_failure_is_not_complete():
+    db = make_sapling_db()
+    session = make_session(db, FailingDaemon())
+
+    response = run(session.sapling_get_block_range(10, 12))
+
+    assert response['success'] is False
+    assert response['complete'] is False
+    assert response['empty'] is False
+    assert response['height_count'] == 3
+    assert response['block_hashes'] == []
+    assert response['blocks'] == []
+    assert response['error']['type'] == 'daemon_error'
+
+
+def test_get_block_range_invalid_range_is_structured():
+    db = make_sapling_db()
+    session = make_session(db, FixtureDaemon([]))
+
+    response = run(session.sapling_get_block_range(20, 19))
+
+    assert response['success'] is False
+    assert response['complete'] is False
+    assert response['empty'] is False
+    assert response['height_count'] == 0
+    assert response['error']['type'] == 'invalid_range'
+
+
+class PartialHashDaemon:
+
+    async def block_hex_hashes(self, start_height, count):
+        return ['11' * 32]
+
+
+def test_get_block_range_partial_hash_response_is_not_complete():
+    db = make_sapling_db()
+    session = make_session(db, PartialHashDaemon())
+
+    response = run(session.sapling_get_block_range(10, 11))
+
+    assert response['success'] is False
+    assert response['complete'] is False
+    assert response['empty'] is False
+    assert response['height_count'] == 2
+    assert response['block_hashes'] == [
+        {'height': 10, 'block_hash': '11' * 32}
+    ]
+    assert response['blocks'] == []
+    assert response['error']['type'] == 'missing_block_hash'
+    assert response['error']['expected_count'] == 2
+    assert response['error']['actual_count'] == 1
+
+
+def test_get_block_range_index_incomplete_is_not_complete():
+    block = load_block_fixture('pivx_mainnet_5057529.json')
+    db = make_sapling_db()
+    session = make_session(db, FixtureDaemon([block]))
+
+    response = run(session.sapling_get_block_range(
+        block['height'], block['height']))
+
+    assert response['success'] is False
+    assert response['complete'] is False
+    assert response['empty'] is False
+    assert response['height_count'] == 1
+    assert response['block_hashes'] == [
+        {'height': block['height'], 'block_hash': block['hash']}
+    ]
+    assert response['blocks'] == []
+    assert response['error']['type'] == 'index_incomplete'
+    assert response['error']['height'] == block['height']
+    assert 'commitment' in response['error']
 
 
 def test_empty_blocks_do_not_consume_sapling_positions():
@@ -271,9 +433,10 @@ def test_get_block_range_returns_canonical_output_order_with_positions():
                     if hasattr(tx_lib, 'hash_to_hex_str')
                     else tx.txid[::-1].hex(),
                 ))
-    assert [(output['position'], output['output_index'], output['cmu'])
+    assert [(output['position'], output['global_position'],
+             output['output_index'], output['cmu'])
             for output in outputs] == [
-                (position, output_index, cmu)
+                (position, position, output_index, cmu)
                 for position, _tx_index, output_index, cmu, _txid
                 in expected_outputs
             ]
@@ -317,6 +480,7 @@ def test_sapling_witness_path_verifies_against_requested_anchor():
     assert witness['root'] == root.hex()
     assert witness['anchor_height'] == 400
     assert witness['position'] == 2
+    assert witness['note_position'] == 2
     assert witness['commitment'] == commitments[2].hex()
     assert verify_indexed_witness(
         witness['commitment'], witness['position'], witness['path'],

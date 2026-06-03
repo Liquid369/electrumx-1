@@ -2093,6 +2093,51 @@ class PIVXSaplingElectrumX(ElectrumX):
     MAX_OUTPUT_LIMIT = 10000
     MAX_NULLIFIER_LIMIT = 10000
 
+    SAPLING_METHOD_ALIASES = {
+        'blockchain.sapling.capabilities': [
+            'blockchain.sapling.get_capabilities',
+            'server.sapling.capabilities',
+        ],
+        'blockchain.sapling.get_block_range': [
+            'blockchain.sapling.get_blocks',
+            'get_block_range',
+            'sapling.get_block_range',
+        ],
+        'blockchain.sapling.get_nullifier_status': [
+            'blockchain.sapling.check_nullifier',
+            'blockchain.nullifier.get_spend',
+        ],
+        'blockchain.sapling.check_nullifiers': [],
+        'blockchain.sapling.get_commitment_info': [
+            'blockchain.sapling.get_commitment',
+            'blockchain.commitment.get_info',
+        ],
+        'blockchain.sapling.get_best_anchor': [
+            'blockchain.sapling.best_anchor',
+        ],
+        'blockchain.sapling.get_anchor_height': [
+            'blockchain.anchor.get_height',
+        ],
+        'blockchain.sapling.get_tree_state': [
+            'blockchain.sapling.get_treestate',
+        ],
+        'blockchain.sapling.get_witness': [],
+        'blockchain.sapling.get_witnesses': [],
+    }
+
+    SAPLING_METHODS = [
+        'blockchain.sapling.capabilities',
+        'blockchain.sapling.get_block_range',
+        'blockchain.sapling.get_nullifier_status',
+        'blockchain.sapling.check_nullifiers',
+        'blockchain.sapling.get_commitment_info',
+        'blockchain.sapling.get_best_anchor',
+        'blockchain.sapling.get_anchor_height',
+        'blockchain.sapling.get_tree_state',
+        'blockchain.sapling.get_witness',
+        'blockchain.sapling.get_witnesses',
+    ]
+
     def set_request_handlers(self, ptuple):
         super().set_request_handlers(ptuple)
         self.request_handlers.update({
@@ -2152,6 +2197,24 @@ class PIVXSaplingElectrumX(ElectrumX):
                 self.transaction_get_sapling,
         })
 
+    async def handle_request(self, request):
+        if (isinstance(request, Request)
+                and self._is_sapling_method(request.method)
+                and request.method not in self.request_handlers):
+            self.session_mgr._method_counts[request.method] += 1
+            return self.sapling_method_not_supported(request.method)
+        return await super().handle_request(request)
+
+    @classmethod
+    def _is_sapling_method(cls, method):
+        return (
+            method.startswith('blockchain.sapling.')
+            or method.startswith('sapling.')
+            or method.startswith('blockchain.nullifier.')
+            or method.startswith('blockchain.commitment.')
+            or method.startswith('blockchain.anchor.')
+        )
+
     def sapling_capabilities(self):
         return {
             'success': True,
@@ -2170,47 +2233,23 @@ class PIVXSaplingElectrumX(ElectrumX):
                 'missing_block',
                 'index_incomplete',
                 'index_error',
+                'unsupported_method',
                 'server_error',
             ],
-            'methods': [
-                'blockchain.sapling.capabilities',
-                'blockchain.sapling.get_block_range',
-                'blockchain.sapling.get_nullifier_status',
-                'blockchain.sapling.get_commitment_info',
-                'blockchain.sapling.get_best_anchor',
-                'blockchain.sapling.get_anchor_height',
-                'blockchain.sapling.get_tree_state',
-                'blockchain.sapling.get_witness',
-                'blockchain.sapling.get_witnesses',
-            ],
-            'aliases': {
-                'blockchain.sapling.capabilities': [
-                    'blockchain.sapling.get_capabilities',
-                    'server.sapling.capabilities',
-                ],
-                'blockchain.sapling.get_block_range': [
-                    'blockchain.sapling.get_blocks',
-                    'get_block_range',
-                    'sapling.get_block_range',
-                ],
-                'blockchain.sapling.get_nullifier_status': [
-                    'blockchain.sapling.check_nullifier',
-                    'blockchain.nullifier.get_spend',
-                ],
-                'blockchain.sapling.check_nullifiers': [],
-                'blockchain.sapling.get_commitment_info': [
-                    'blockchain.sapling.get_commitment',
-                    'blockchain.commitment.get_info',
-                ],
-                'blockchain.sapling.get_best_anchor': [
-                    'blockchain.sapling.best_anchor',
-                ],
-                'blockchain.sapling.get_anchor_height': [
-                    'blockchain.anchor.get_height',
-                ],
-                'blockchain.sapling.get_tree_state': [
-                    'blockchain.sapling.get_treestate',
-                ],
+            'methods': self.SAPLING_METHODS,
+            'aliases': self.SAPLING_METHOD_ALIASES,
+        }
+
+    def sapling_method_not_supported(self, method):
+        return {
+            'success': False,
+            'contract': PIVX_SAPLING_RPC_CONTRACT,
+            'method': method,
+            'supported_methods': self.SAPLING_METHODS,
+            'aliases': self.SAPLING_METHOD_ALIASES,
+            'error': {
+                'type': 'unsupported_method',
+                'message': f'unsupported Sapling method: {method}',
             },
         }
 
@@ -2218,6 +2257,11 @@ class PIVXSaplingElectrumX(ElectrumX):
     def _sapling_range_response(start_height, end_height, blocks, complete,
                                 error=None, total_sapling_txs=0,
                                 block_hashes=None):
+        height_count = (
+            end_height - start_height + 1
+            if isinstance(start_height, int) and isinstance(end_height, int)
+            and end_height >= start_height else 0
+        )
         return {
             'success': complete and error is None,
             'complete': complete,
@@ -2225,7 +2269,7 @@ class PIVXSaplingElectrumX(ElectrumX):
             'contract': PIVX_SAPLING_RPC_CONTRACT,
             'start_height': start_height,
             'end_height': end_height,
-            'height_count': end_height - start_height + 1,
+            'height_count': height_count,
             'block_count': len(blocks),
             'sapling_tx_count': total_sapling_txs,
             'block_hashes': block_hashes or [],
@@ -2390,12 +2434,6 @@ class PIVXSaplingElectrumX(ElectrumX):
                 start_height, block_count
             )
 
-            if len(block_hashes) != block_count:
-                return self._sapling_range_error_response(
-                    start_height, end_height, blocks, 'missing_block_hash',
-                    'daemon returned an incomplete block hash range',
-                    total_sapling_txs, block_hash_items)
-
             block_hash_items = [
                 {
                     'height': start_height + index,
@@ -2404,13 +2442,23 @@ class PIVXSaplingElectrumX(ElectrumX):
                 for index, block_hash in enumerate(block_hashes)
             ]
 
+            if len(block_hashes) != block_count:
+                return self._sapling_range_error_response(
+                    start_height, end_height, blocks, 'missing_block_hash',
+                    'daemon returned an incomplete block hash range',
+                    total_sapling_txs, block_hash_items,
+                    expected_count=block_count,
+                    actual_count=len(block_hashes))
+
             # Get raw blocks using proper daemon API
             raw_blocks = await self.session_mgr.daemon.raw_blocks(block_hashes)
             if len(raw_blocks) != block_count:
                 return self._sapling_range_error_response(
                     start_height, end_height, blocks, 'missing_block',
                     'daemon returned an incomplete raw block range',
-                    total_sapling_txs, block_hash_items)
+                    total_sapling_txs, block_hash_items,
+                    expected_count=block_count,
+                    actual_count=len(raw_blocks))
 
             # Process each block
             for i, (block_hash, block_data) in enumerate(
@@ -2439,8 +2487,22 @@ class PIVXSaplingElectrumX(ElectrumX):
                         # Compact outputs (for receiving)
                         compact_outputs = []
                         for output_index, output in enumerate(tx.sapling_outputs):
-                            commitment_info = self.db.get_commitment_position_info(
-                                output.cmu)
+                            try:
+                                commitment_info = (
+                                    self.db.get_commitment_position_info(
+                                        output.cmu)
+                                )
+                            except self.db.DBError as e:
+                                return self._sapling_range_error_response(
+                                    start_height, end_height, blocks,
+                                    'index_error',
+                                    f'Sapling index lookup failed: {e}',
+                                    total_sapling_txs, block_hash_items,
+                                    height=height, block_hash=block_hash,
+                                    txid=txid_hex,
+                                    tx_index=tx_index,
+                                    output_index=output_index,
+                                    commitment=output.cmu.hex())
                             if commitment_info is None:
                                 return self._sapling_range_error_response(
                                     start_height, end_height, blocks,
@@ -2466,6 +2528,7 @@ class PIVXSaplingElectrumX(ElectrumX):
                                     commitment=output.cmu.hex())
                             output_data = {
                                 'position': position,
+                                'global_position': position,
                                 'txid': txid_hex,
                                 'tx_index': tx_index,
                                 'output_index': output_index,

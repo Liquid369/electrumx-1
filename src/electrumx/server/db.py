@@ -1280,6 +1280,7 @@ class DB:
             'root': root.hex(),
             'anchor_height': height,
             'position': position,
+            'note_position': position,
             'path': self.sapling_witness_path(commitments, position),
             'commitment': commitment.hex(),
         }

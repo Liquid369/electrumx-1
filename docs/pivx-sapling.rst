@@ -13,6 +13,13 @@ PIVX activated Sapling (privacy protocol) at:
 * **Mainnet**: Block 2,700,500
 * **Testnet**: Block 201
 
+These heights are pinned to PIVX Core ``v5.6.1`` tag ``af60f19`` in
+``src/chainparams.cpp``.  Sapling activation corresponds to
+``Consensus::UPGRADE_V5_0``:
+
+* mainnet ``consensus.vUpgrades[Consensus::UPGRADE_V5_0].nActivationHeight = 2700500``
+* testnet ``consensus.vUpgrades[Consensus::UPGRADE_V5_0].nActivationHeight = 201``
+
 The implementation indexes all Sapling outputs (commitments), spends (nullifiers),
 and maintains the commitment tree state required for light wallet operations.
 
@@ -86,59 +93,98 @@ Get compact block data for scanning. **Primary API for sync.**
 
 * ``start_height`` (int): Starting block height (inclusive)
 * ``end_height`` (int): Ending block height (inclusive)
-* Maximum range: 1000 blocks per request
+* Maximum range: 100 blocks per request
 
 **Returns:**
 
 .. code-block:: json
 
-   [
-     {
-       "height": 5057529,
-       "hash": "86165f...",
-       "time": 1756978980,
-       "txs": [
-         {
-           "txid": "b1fd0e7f...",
-           "outputs": [
-             {
-               "cmu": "a3a5aca5...",
-               "epk": "28e5a699...",
-               "ciphertext": "b76937c4...",
-               "cv": "...",
-               "out_ciphertext": "..."
-             }
-           ],
-           "spends": [
-             {
-               "nullifier": "...",
-               "cv": "...",
-               "anchor": "...",
-               "rk": "..."
-             }
-           ]
-         }
-       ]
-     }
-   ]
+   {
+     "success": true,
+     "complete": true,
+     "empty": false,
+     "contract": "pivx.sapling.electrumx.v1",
+     "start_height": 5057529,
+     "end_height": 5057529,
+     "height_count": 1,
+     "block_count": 1,
+     "block_hashes": [
+       {
+         "height": 5057529,
+         "block_hash": "86165f..."
+       }
+     ],
+     "blocks": [
+       {
+         "height": 5057529,
+         "hash": "86165f...",
+         "block_hash": "86165f...",
+         "time": 1756978980,
+         "outputs": [
+           {
+             "position": 1234,
+             "global_position": 1234,
+             "txid": "b1fd0e7f...",
+             "tx_index": 3,
+             "output_index": 0,
+             "cmu": "a3a5aca5...",
+             "epk": "28e5a699...",
+             "ciphertext": "b76937c4...",
+             "cv": "...",
+             "out_ciphertext": "..."
+           }
+         ],
+         "txs": [
+           {
+             "txid": "b1fd0e7f...",
+             "outputs": ["..."],
+             "spends": [
+               {
+                 "nullifier": "...",
+                 "cv": "...",
+                 "anchor": "...",
+                 "rk": "...",
+                 "spend_index": 0
+               }
+             ]
+           }
+         ]
+       }
+     ],
+     "error": null
+   }
+
+``success`` and ``complete`` are true only when every requested height was
+scanned.  Empty successful ranges return ``success=true``, ``complete=true``,
+``empty=true``, and ``error=null``.  Daemon, index, method, and invalid-range
+failures return ``success=false``, ``complete=false``, and a structured
+``error`` object, so a failed range never looks complete.
+
+``block_hashes`` contains every scanned height, including heights without
+Sapling transactions.  Cake Wallet and other clients should persist these hashes
+with scanned state and compare them during rollback-window rescans to detect
+stale local state after reorgs.
 
 **Usage Example:**
 
 .. code-block:: python
 
-   # Sync 1000 blocks at a time
+   # Sync 100 blocks at a time
    start = 2700500  # Sapling activation
-   batch_size = 1000
+   batch_size = 100
    
    while start < current_height:
        end = min(start + batch_size - 1, current_height)
-       blocks = await electrum.request(
+       response = await electrum.request(
            'blockchain.sapling.get_block_range',
            start, end
        )
+
+       if not response['success']:
+           raise RuntimeError(response['error'])
        
        # Process blocks
-       for block in blocks:
+       for block in response['blocks']:
            for tx in block['txs']:
                # Trial decrypt outputs
                for output in tx['outputs']:
@@ -226,6 +272,40 @@ Check if a specific nullifier has been spent.
      "txid": "...",
      "height": 5057530
    }
+
+blockchain.sapling.get_witness
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Return an anchor-bound witness for a Sapling output position or commitment.
+
+**Parameters:**
+
+* ``position`` (int or 32-byte commitment hex): Global Sapling output position,
+  or a commitment whose global position is indexed.
+* ``anchor_hex`` (string, optional): 32-byte Sapling root/anchor.  If supplied,
+  the witness is generated against that exact root.
+
+**Returns:**
+
+.. code-block:: json
+
+   {
+     "anchor": "...",
+     "root": "...",
+     "anchor_height": 5057529,
+     "position": 1234,
+     "note_position": 1234,
+     "path": [
+       {
+         "position": "left",
+         "hash": "..."
+       }
+     ],
+     "commitment": "..."
+   }
+
+Clients must verify that the path recomputes ``root`` from ``commitment`` and
+``note_position`` before using the witness for spending.
 
 blockchain.sapling.get_tree_state
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -345,10 +425,27 @@ Recommended approach for light wallets:
    * Fetch new blocks since last sync
    * Update balance and transaction history
 
-3. **Periodic Re-sync**:
+3. **Periodic Re-sync / Reorg Handling**:
    
-   * Re-scan recent blocks (last 100) for reorgs
+   * Re-scan recent blocks from
+     ``max(SAPLING_START_HEIGHT, last_scanned_height - 99)``.
+   * PIVX ElectrumX keeps ``REORG_LIMIT = 100`` for mainnet, so the server
+     retains enough undo/raw-block state for at least 100-block rollback.
+   * Compare returned ``block_hashes`` against locally stored scanned hashes.
+     Any mismatch means local Sapling notes, nullifier status, tree state, and
+     witnesses from that height forward must be rolled back and rescanned.
    * Verify nullifier status hasn't changed
+
+Server-side reorg behavior:
+
+* Removed Sapling outputs delete commitment and position indexes.
+* Removed Sapling spends delete nullifier and anchor indexes.
+* Sapling roots/anchors at or after the backed-up height are deleted.
+* A nullifier removed by reorg may be indexed again if it is spent on a
+  different branch.
+* Global Sapling output positions are rolled back to the first removed
+  position, so the replacement branch receives canonical positions for the new
+  chain.
 
 Example: Cake Wallet Integration
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
