@@ -236,7 +236,7 @@ def test_client_can_rescan_full_pivx_rollback_boundary_with_hashes():
 def test_sapling_capabilities_document_cake_wallet_v1_contract():
     session = make_session(make_sapling_db(), FixtureDaemon([]))
 
-    capabilities = session.sapling_capabilities()
+    capabilities = run(session.sapling_capabilities())
 
     assert capabilities['success'] is True
     assert capabilities['contract'] == PIVX_SAPLING_RPC_CONTRACT
@@ -255,6 +255,19 @@ def test_sapling_capabilities_document_cake_wallet_v1_contract():
         assert method in capabilities['methods']
     assert 'get_block_range' in capabilities['aliases'][
         'blockchain.sapling.get_block_range']
+
+
+def test_sapling_capabilities_request_handler_is_awaitable():
+    session = make_session(make_sapling_db(), FixtureDaemon([]))
+    session.request_handlers = {
+        'blockchain.sapling.capabilities': session.sapling_capabilities,
+    }
+
+    response = run(session.handle_request(
+        Request('blockchain.sapling.capabilities', [])))
+
+    assert response['success'] is True
+    assert response['contract'] == PIVX_SAPLING_RPC_CONTRACT
 
 
 def test_sapling_unknown_contract_method_returns_structured_error():

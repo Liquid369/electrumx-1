@@ -2215,7 +2215,7 @@ class PIVXSaplingElectrumX(ElectrumX):
             or method.startswith('blockchain.anchor.')
         )
 
-    def sapling_capabilities(self):
+    async def sapling_capabilities(self):
         return {
             'success': True,
             'contract': PIVX_SAPLING_RPC_CONTRACT,
