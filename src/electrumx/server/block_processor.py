@@ -897,21 +897,17 @@ class PIVXSaplingBlockProcessor(BlockProcessor):
     def flush_data(self):
         '''Override to include Sapling data in flush.'''
         flush_data = super().flush_data()
-        # Add Sapling data to flush
-        flush_data.sapling_nullifiers = self.sapling_nullifiers[:]
-        flush_data.sapling_commitments = self.sapling_commitments[:]
-        flush_data.sapling_anchors = self.sapling_anchors[:]
-        flush_data.sapling_delete_nullifiers = self.sapling_undo_nullifiers[:]
-        flush_data.sapling_delete_commitments = self.sapling_undo_commitments[:]
-        flush_data.sapling_delete_anchors = self.sapling_undo_anchors[:]
+        # Add Sapling data to flush.  These must be the live lists, not copies:
+        # filesystem/history-only flushes do not write UTXO-backed Sapling
+        # indexes, so the DB layer should clear them only after an actual UTXO
+        # flush commits them.
+        flush_data.sapling_nullifiers = self.sapling_nullifiers
+        flush_data.sapling_commitments = self.sapling_commitments
+        flush_data.sapling_anchors = self.sapling_anchors
+        flush_data.sapling_delete_nullifiers = self.sapling_undo_nullifiers
+        flush_data.sapling_delete_commitments = self.sapling_undo_commitments
+        flush_data.sapling_delete_anchors = self.sapling_undo_anchors
         flush_data.sapling_backup_height_start = self.height + 1
-        # Clear our caches after copying
-        self.sapling_nullifiers.clear()
-        self.sapling_commitments.clear()
-        self.sapling_anchors.clear()
-        self.sapling_undo_nullifiers.clear()
-        self.sapling_undo_commitments.clear()
-        self.sapling_undo_anchors.clear()
         return flush_data
 
     def advance_txs(

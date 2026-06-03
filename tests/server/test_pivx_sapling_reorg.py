@@ -11,7 +11,7 @@ from electrumx.lib.coins import Pivx, PivxTestnet
 from electrumx.lib import tx as tx_lib
 from electrumx.server.daemon import DaemonError
 from electrumx.server.block_processor import BlockProcessor, PIVXSaplingBlockProcessor
-from electrumx.server.db import DB
+from electrumx.server.db import DB, FlushData
 from electrumx.server.session import (
     PIVXSaplingElectrumX,
     PIVX_SAPLING_MAX_BLOCK_RANGE,
@@ -201,6 +201,35 @@ def test_sapling_block_processor_indexes_current_block_height(monkeypatch):
     )
     assert indexed_heights
     assert set(indexed_heights) == {block['height']}
+
+
+def test_sapling_flush_data_keeps_live_lists_until_utxo_flush(monkeypatch):
+    processor = object.__new__(PIVXSaplingBlockProcessor)
+    processor.height = 123
+    processor.sapling_nullifiers = [(b'n' * 32, b't' * 32, 123, 0)]
+    processor.sapling_commitments = [(b'c' * 32, b't' * 32, 0, 123)]
+    processor.sapling_anchors = [(b'a' * 32, 123)]
+    processor.sapling_undo_nullifiers = []
+    processor.sapling_undo_commitments = []
+    processor.sapling_undo_anchors = []
+    base_flush_data = FlushData(
+        123, 10, [], [], [], {}, [], b'h' * 32,
+    )
+
+    monkeypatch.setattr(
+        BlockProcessor,
+        'flush_data',
+        lambda _self: base_flush_data,
+    )
+
+    flush_data = processor.flush_data()
+
+    assert flush_data.sapling_nullifiers is processor.sapling_nullifiers
+    assert flush_data.sapling_commitments is processor.sapling_commitments
+    assert flush_data.sapling_anchors is processor.sapling_anchors
+    assert processor.sapling_commitments
+    flush_data.sapling_commitments.clear()
+    assert processor.sapling_commitments == []
 
 
 class FixtureDaemon:
