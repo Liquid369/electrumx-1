@@ -10,6 +10,7 @@ from aiorpcx import Request
 from electrumx.lib.coins import Pivx, PivxTestnet
 from electrumx.lib import tx as tx_lib
 from electrumx.server.daemon import DaemonError
+from electrumx.server.block_processor import BlockProcessor, PIVXSaplingBlockProcessor
 from electrumx.server.db import DB
 from electrumx.server.session import (
     PIVXSaplingElectrumX,
@@ -173,6 +174,33 @@ def index_block_sapling(db, block):
                 commitments.append((output.cmu, tx.txid, output_index,
                                     block['height']))
     db.flush_sapling_data(db.utxo_db, nullifiers, commitments, anchors)
+
+
+def test_sapling_block_processor_indexes_current_block_height(monkeypatch):
+    block = load_block_fixture('pivx_mainnet_2703076.json')
+    txs = parse_block_txs(block)
+    processor = object.__new__(PIVXSaplingBlockProcessor)
+    processor.height = block['height'] - 1
+    processor._advance_block_height = block['height']
+    processor.sapling_nullifiers = []
+    processor.sapling_commitments = []
+    processor.sapling_anchors = []
+
+    monkeypatch.setattr(
+        BlockProcessor,
+        'advance_txs',
+        lambda _self, _txs, _is_unspendable: [],
+    )
+
+    processor.advance_txs(txs, lambda _script: False)
+
+    indexed_heights = (
+        [item[2] for item in processor.sapling_nullifiers]
+        + [item[3] for item in processor.sapling_commitments]
+        + [item[1] for item in processor.sapling_anchors]
+    )
+    assert indexed_heights
+    assert set(indexed_heights) == {block['height']}
 
 
 class FixtureDaemon:
