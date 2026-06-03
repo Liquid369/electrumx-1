@@ -40,11 +40,39 @@ To detect when shielded notes are spent:
 Spending Shielded Funds
 ~~~~~~~~~~~~~~~~~~~~~~~
 
-**Note**: Witness/proof generation requires the full Sapling tree and is not
-yet implemented in ElectrumX. For spending, wallets should:
+**Status**: Design phase - full technical specification available
 
-* Use the full PIVX node for witness generation, OR
-* Maintain local incremental Merkle tree by syncing from genesis
+Witness/proof generation requires the full Sapling commitment tree. This is
+a fundamental architectural challenge for light wallets.
+
+**Two approaches are documented**:
+
+1. **Local Incremental Merkle Tree** (Recommended)
+   
+   - Wallet maintains own Sapling tree by syncing commitments
+   - Generates witnesses and proofs locally
+   - Full privacy, no external dependencies
+   - Initial sync: 1-2 hours, ~1GB storage
+   - See: :doc:`pivx-sapling-spending` for complete specification
+
+2. **Full Node Witness/Proof Service** (Fallback)
+   
+   - Delegate witness generation to trusted PIVX Core node
+   - Lower storage requirements
+   - Privacy tradeoff: node learns spending patterns
+   - Requires trusted full node access
+
+**For complete implementation details**, including:
+
+- System architecture and data flows
+- Step-by-step spend transaction construction
+- Incremental Merkle tree algorithms
+- Reorg handling and safety protocols
+- Security and privacy analysis
+- Phased implementation plan (15-20 weeks)
+
+See the comprehensive technical specification:
+:doc:`pivx-sapling-spending`
 
 API Reference
 -------------

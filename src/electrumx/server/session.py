@@ -48,6 +48,8 @@ if TYPE_CHECKING:
 
 BAD_REQUEST = 1
 DAEMON_ERROR = 2
+PIVX_SAPLING_MAX_BLOCK_RANGE = 100
+PIVX_SAPLING_RPC_CONTRACT = 'pivx.sapling.electrumx.v1'
 
 
 def scripthash_to_hashX(scripthash):
@@ -2094,19 +2096,37 @@ class PIVXSaplingElectrumX(ElectrumX):
     def set_request_handlers(self, ptuple):
         super().set_request_handlers(ptuple)
         self.request_handlers.update({
+            'blockchain.sapling.capabilities':
+                self.sapling_capabilities,
+            'blockchain.sapling.get_capabilities':
+                self.sapling_capabilities,
+            'server.sapling.capabilities':
+                self.sapling_capabilities,
             # Core Cake Wallet APIs
             'blockchain.sapling.get_outputs':
                 self.sapling_get_outputs,
             'blockchain.sapling.get_witness':
                 self.sapling_get_witness,
+            'blockchain.sapling.get_witnesses':
+                self.sapling_get_witnesses,
             'blockchain.sapling.get_nullifiers':
                 self.sapling_get_nullifiers,
+            'blockchain.sapling.get_nullifier_status':
+                self.sapling_get_nullifier_status,
+            'blockchain.sapling.check_nullifier':
+                self.sapling_get_nullifier_status,
+            'blockchain.sapling.check_nullifiers':
+                self.sapling_check_nullifiers,
             'blockchain.sapling.get_tree_state':
+                self.sapling_get_tree_state,
+            'blockchain.sapling.get_treestate':
                 self.sapling_get_tree_state,
             'blockchain.nullifier.get_spend':
                 self.nullifier_get_spend,
             # Zcash lightwalletd compatible methods
             'blockchain.sapling.get_block_range':
+                self.sapling_get_block_range,
+            'blockchain.sapling.get_blocks':
                 self.sapling_get_block_range,
             # Alias without blockchain prefix for compatibility
             'get_block_range':
@@ -2116,11 +2136,116 @@ class PIVXSaplingElectrumX(ElectrumX):
             # Additional utility methods
             'blockchain.commitment.get_info':
                 self.commitment_get_info,
+            'blockchain.sapling.get_commitment_info':
+                self.commitment_get_info,
+            'blockchain.sapling.get_commitment':
+                self.commitment_get_info,
             'blockchain.anchor.get_height':
                 self.anchor_get_height,
+            'blockchain.sapling.get_anchor_height':
+                self.anchor_get_height,
+            'blockchain.sapling.get_best_anchor':
+                self.sapling_get_best_anchor,
+            'blockchain.sapling.best_anchor':
+                self.sapling_get_best_anchor,
             'blockchain.transaction.get_sapling':
                 self.transaction_get_sapling,
         })
+
+    def sapling_capabilities(self):
+        return {
+            'success': True,
+            'contract': PIVX_SAPLING_RPC_CONTRACT,
+            'version': 1,
+            'coin': self.coin.SHORTNAME,
+            'network': self.coin.NET,
+            'sapling_activation_height':
+                getattr(self.coin, 'SAPLING_START_HEIGHT', None),
+            'max_block_range': PIVX_SAPLING_MAX_BLOCK_RANGE,
+            'range_response': 'envelope',
+            'range_error_types': [
+                'invalid_range',
+                'daemon_error',
+                'missing_block_hash',
+                'missing_block',
+                'index_incomplete',
+                'index_error',
+                'server_error',
+            ],
+            'methods': [
+                'blockchain.sapling.capabilities',
+                'blockchain.sapling.get_block_range',
+                'blockchain.sapling.get_nullifier_status',
+                'blockchain.sapling.get_commitment_info',
+                'blockchain.sapling.get_best_anchor',
+                'blockchain.sapling.get_anchor_height',
+                'blockchain.sapling.get_tree_state',
+                'blockchain.sapling.get_witness',
+                'blockchain.sapling.get_witnesses',
+            ],
+            'aliases': {
+                'blockchain.sapling.capabilities': [
+                    'blockchain.sapling.get_capabilities',
+                    'server.sapling.capabilities',
+                ],
+                'blockchain.sapling.get_block_range': [
+                    'blockchain.sapling.get_blocks',
+                    'get_block_range',
+                    'sapling.get_block_range',
+                ],
+                'blockchain.sapling.get_nullifier_status': [
+                    'blockchain.sapling.check_nullifier',
+                    'blockchain.nullifier.get_spend',
+                ],
+                'blockchain.sapling.check_nullifiers': [],
+                'blockchain.sapling.get_commitment_info': [
+                    'blockchain.sapling.get_commitment',
+                    'blockchain.commitment.get_info',
+                ],
+                'blockchain.sapling.get_best_anchor': [
+                    'blockchain.sapling.best_anchor',
+                ],
+                'blockchain.sapling.get_anchor_height': [
+                    'blockchain.anchor.get_height',
+                ],
+                'blockchain.sapling.get_tree_state': [
+                    'blockchain.sapling.get_treestate',
+                ],
+            },
+        }
+
+    @staticmethod
+    def _sapling_range_response(start_height, end_height, blocks, complete,
+                                error=None, total_sapling_txs=0,
+                                block_hashes=None):
+        return {
+            'success': complete and error is None,
+            'complete': complete,
+            'empty': complete and not blocks,
+            'contract': PIVX_SAPLING_RPC_CONTRACT,
+            'start_height': start_height,
+            'end_height': end_height,
+            'height_count': end_height - start_height + 1,
+            'block_count': len(blocks),
+            'sapling_tx_count': total_sapling_txs,
+            'block_hashes': block_hashes or [],
+            'blocks': blocks,
+            'error': error,
+        }
+
+    def _sapling_range_error_response(self, start_height, end_height, blocks,
+                                      error_type, message,
+                                      total_sapling_txs=0,
+                                      block_hashes=None, **context):
+        error = {
+            'type': error_type,
+            'message': message,
+        }
+        error.update({key: value for key, value in context.items()
+                      if value is not None})
+        return self._sapling_range_response(start_height, end_height, blocks,
+                                            False, error,
+                                            total_sapling_txs, block_hashes)
 
     # =========================================================================
     # CAKE WALLET CORE APIs
@@ -2227,28 +2352,37 @@ class PIVXSaplingElectrumX(ElectrumX):
         start_height: starting block height (inclusive)
         end_height: ending block height (inclusive)
 
-        Returns list of compact blocks.
+        Returns a v1 response envelope. ``success`` and ``complete`` are only
+        true when every requested height was scanned. ``block_hashes`` contains
+        every scanned height, including heights with no Sapling transactions.
         '''
         from electrumx.lib.tx import TxPIVXSapling
 
-        start_height = non_negative_integer(start_height)
-        end_height = non_negative_integer(end_height)
+        try:
+            start_height = non_negative_integer(start_height)
+            end_height = non_negative_integer(end_height)
+        except RPCError as e:
+            return self._sapling_range_error_response(
+                0, 0, [], 'invalid_range', e.message)
 
         if end_height < start_height:
-            raise RPCError(BAD_REQUEST, 'end_height must be >= start_height')
+            return self._sapling_range_error_response(
+                start_height, end_height, [], 'invalid_range',
+                'end_height must be >= start_height')
 
-        max_blocks = 1000  # Allow larger batches for faster sync
         block_count = end_height - start_height + 1
-        if block_count > max_blocks:
-            raise RPCError(
-                BAD_REQUEST,
-                f'range too large, max {max_blocks} blocks'
-            )
+        if block_count > PIVX_SAPLING_MAX_BLOCK_RANGE:
+            return self._sapling_range_error_response(
+                start_height, end_height, [], 'invalid_range',
+                f'range too large, max {PIVX_SAPLING_MAX_BLOCK_RANGE} blocks',
+                max_block_range=PIVX_SAPLING_MAX_BLOCK_RANGE)
 
         # Cost based on range size
         self.bump_cost(2.0 + block_count * 0.1)
 
         blocks = []
+        block_hash_items = []
+        total_sapling_txs = 0
 
         try:
             # Get block hashes for the range using proper daemon API
@@ -2256,11 +2390,27 @@ class PIVXSaplingElectrumX(ElectrumX):
                 start_height, block_count
             )
 
-            if not block_hashes:
-                return blocks
+            if len(block_hashes) != block_count:
+                return self._sapling_range_error_response(
+                    start_height, end_height, blocks, 'missing_block_hash',
+                    'daemon returned an incomplete block hash range',
+                    total_sapling_txs, block_hash_items)
+
+            block_hash_items = [
+                {
+                    'height': start_height + index,
+                    'block_hash': block_hash,
+                }
+                for index, block_hash in enumerate(block_hashes)
+            ]
 
             # Get raw blocks using proper daemon API
             raw_blocks = await self.session_mgr.daemon.raw_blocks(block_hashes)
+            if len(raw_blocks) != block_count:
+                return self._sapling_range_error_response(
+                    start_height, end_height, blocks, 'missing_block',
+                    'daemon returned an incomplete raw block range',
+                    total_sapling_txs, block_hash_items)
 
             # Process each block
             for i, (block_hash, block_data) in enumerate(
@@ -2280,110 +2430,137 @@ class PIVXSaplingElectrumX(ElectrumX):
                 txs = deserializer.read_tx_block()
 
                 compact_txs = []
-                for tx in txs:
+                block_outputs = []
+                for tx_index, tx in enumerate(txs):
                     if isinstance(tx, TxPIVXSapling) and (
                         tx.sapling_outputs or tx.sapling_spends
                     ):
+                        txid_hex = hash_to_hex_str(tx.txid)
                         # Compact outputs (for receiving)
                         compact_outputs = []
-                        for output in tx.sapling_outputs:
-                            compact_outputs.append({
+                        for output_index, output in enumerate(tx.sapling_outputs):
+                            commitment_info = self.db.get_commitment_position_info(
+                                output.cmu)
+                            if commitment_info is None:
+                                return self._sapling_range_error_response(
+                                    start_height, end_height, blocks,
+                                    'index_incomplete',
+                                    'Sapling commitment is not indexed',
+                                    total_sapling_txs, block_hash_items,
+                                    height=height, block_hash=block_hash,
+                                    txid=txid_hex,
+                                    tx_index=tx_index,
+                                    output_index=output_index,
+                                    commitment=output.cmu.hex())
+                            _tx_hash, _idx, _h, position = commitment_info
+                            if position is None:
+                                return self._sapling_range_error_response(
+                                    start_height, end_height, blocks,
+                                    'index_incomplete',
+                                    'Sapling commitment has no global position',
+                                    total_sapling_txs, block_hash_items,
+                                    height=height, block_hash=block_hash,
+                                    txid=txid_hex,
+                                    tx_index=tx_index,
+                                    output_index=output_index,
+                                    commitment=output.cmu.hex())
+                            output_data = {
+                                'position': position,
+                                'txid': txid_hex,
+                                'tx_index': tx_index,
+                                'output_index': output_index,
                                 'cmu': output.cmu.hex(),
                                 'epk': output.ephemeral_key.hex(),
+                                'ephemeral_key': output.ephemeral_key.hex(),
                                 'ciphertext': output.enc_ciphertext.hex(),
+                                'enc_ciphertext': output.enc_ciphertext.hex(),
                                 'cv': output.cv.hex(),
                                 'out_ciphertext': output.out_ciphertext.hex(),
-                            })
+                            }
+                            compact_outputs.append(output_data)
+                            block_outputs.append(output_data)
 
                         # Compact spends/nullifiers (for sync)
                         compact_spends = []
-                        for spend in tx.sapling_spends:
+                        for spend_index, spend in enumerate(tx.sapling_spends):
                             compact_spends.append({
                                 'nullifier': spend.nullifier.hex(),
                                 'cv': spend.cv.hex(),
                                 'anchor': spend.anchor.hex(),
                                 'rk': spend.rk.hex(),
+                                'spend_index': spend_index,
                             })
 
                         compact_txs.append({
-                            'txid': tx.txid.hex(),
+                            'txid': txid_hex,
                             'outputs': compact_outputs,
                             'spends': compact_spends,
                         })
 
-                # Always include block even if no Sapling txs
-                blocks.append({
-                    'height': height,
-                    'hash': block_hash,
-                    'time': block_time,
-                    'txs': compact_txs,
-                })
+                if compact_txs:
+                    blocks.append({
+                        'height': height,
+                        'hash': block_hash,
+                        'block_hash': block_hash,
+                        'time': block_time,
+                        'outputs': block_outputs,
+                        'txs': compact_txs,
+                    })
+                    total_sapling_txs += len(compact_txs)
 
         except DaemonError as e:
             self.logger.error(f'get_block_range daemon error: {e}')
+            return self._sapling_range_response(
+                start_height, end_height, blocks, False,
+                {'type': 'daemon_error', 'message': str(e)},
+                total_sapling_txs, block_hash_items)
         except Exception as e:
             self.logger.error(f'get_block_range error: {e}')
+            return self._sapling_range_response(
+                start_height, end_height, blocks, False,
+                {'type': 'server_error', 'message': str(e)},
+                total_sapling_txs, block_hash_items)
 
-        return blocks
+        return self._sapling_range_response(
+            start_height, end_height, blocks, True, None,
+            total_sapling_txs, block_hash_items)
 
     async def sapling_get_witness(
             self,
-            commitment_hex: str,
-            anchor_height: int
+            position,
+            anchor_hex: str = None
     ):
-        '''Get Merkle witness for a commitment (SENDING/spend proof).
-
-        Returns the position and Merkle path needed to construct
-        a spend proof for a shielded note.
-
-        commitment_hex: 32-byte commitment (cmu) as hex string
-        anchor_height: block height of the anchor to use
-
-        Returns: position, path (32 hashes), anchor
-        '''
+        '''Return an anchor-bound witness for a Sapling output position.'''
         self.bump_cost(5.0)  # Expensive operation
 
-        # Validate inputs
-        assert_hex_str(commitment_hex)
-        if len(commitment_hex) != 64:
-            raise RPCError(BAD_REQUEST, 'commitment must be 32 bytes (64 hex)')
-        anchor_height = non_negative_integer(anchor_height)
+        if isinstance(position, str) and len(position) == 64:
+            assert_hex_str(position)
+            info = self.db.get_commitment_position_info(bytes.fromhex(position))
+            if info is None or info[3] is None:
+                raise RPCError(BAD_REQUEST, 'commitment not found')
+            position = info[3]
+        else:
+            position = non_negative_integer(position)
 
-        commitment = bytes.fromhex(commitment_hex)
+        anchor = None
+        if anchor_hex is not None:
+            assert_hex_str(anchor_hex)
+            if len(anchor_hex) != 64:
+                raise RPCError(BAD_REQUEST, 'anchor must be 32 bytes (64 hex)')
+            anchor = bytes.fromhex(anchor_hex)
 
-        # Get commitment info to find its position
-        commitment_info = self.db.get_commitment_info(commitment)
-        if commitment_info is None:
-            raise RPCError(BAD_REQUEST, 'commitment not found')
-
-        tx_hash, output_index, commit_height = commitment_info
-
-        if commit_height > anchor_height:
-            raise RPCError(
-                BAD_REQUEST,
-                'commitment height is after anchor height'
-            )
-
-        # Get witness data from the database
-        witness = self.db.get_sapling_witness(commitment, anchor_height)
+        witness = self.db.get_sapling_witness(position, anchor)
         if witness is None:
-            # Witness computation not yet implemented
-            # Return error with helpful message
-            raise RPCError(
-                BAD_REQUEST,
-                'witness computation requires incremental merkle tree - '
-                'not yet implemented. Use full node for spending.'
-            )
+            raise RPCError(BAD_REQUEST, f'witness not found for position {position}')
+        return witness
 
-        position, path, anchor = witness
-
-        return {
-            'position': position,
-            'path': [h.hex() for h in path],
-            'anchor': anchor.hex(),
-            'commitment': commitment_hex,
-            'commitment_height': commit_height,
-        }
+    async def sapling_get_witnesses(self, positions, anchor_hex: str = None):
+        if not isinstance(positions, list):
+            raise RPCError(BAD_REQUEST, 'positions must be a list')
+        if len(positions) > 100:
+            raise RPCError(BAD_REQUEST, 'cannot request more than 100 witnesses')
+        return [await self.sapling_get_witness(position, anchor_hex)
+                for position in positions]
 
     async def sapling_get_nullifiers(
             self,
@@ -2467,10 +2644,39 @@ class PIVXSaplingElectrumX(ElectrumX):
         if result is None:
             return None
 
-        tx_hash, height = result
+        tx_hash, height, spend_index = result
         return {
             'txid': hash_to_hex_str(tx_hash),
             'height': height,
+            'spend_index': spend_index,
+        }
+
+    async def sapling_get_nullifier_status(self, nullifier_hex: str):
+        result = await self.nullifier_get_spend(nullifier_hex)
+        if result is None:
+            return {'spent': False}
+        return {
+            'spent': True,
+            'tx_hash': result['txid'],
+            'txid': result['txid'],
+            'height': result['height'],
+            'spend_index': result['spend_index'],
+        }
+
+    async def sapling_check_nullifiers(self, nullifiers):
+        if isinstance(nullifiers, dict):
+            nullifiers = nullifiers.get('nullifiers')
+        if not isinstance(nullifiers, list):
+            raise RPCError(BAD_REQUEST, 'nullifiers must be a list')
+        if len(nullifiers) > self.MAX_NULLIFIER_LIMIT:
+            raise RPCError(BAD_REQUEST, 'too many nullifiers requested')
+        return {
+            'success': True,
+            'contract': PIVX_SAPLING_RPC_CONTRACT,
+            'results': {
+                nullifier: await self.sapling_get_nullifier_status(nullifier)
+                for nullifier in nullifiers
+            },
         }
 
     # =========================================================================
@@ -2498,10 +2704,29 @@ class PIVXSaplingElectrumX(ElectrumX):
             return None
 
         tx_hash, output_index, height = result
+        position = None
+        position_info = self.db.get_commitment_position_info(commitment)
+        if position_info is not None:
+            position = position_info[3]
         return {
             'txid': hash_to_hex_str(tx_hash),
             'output_index': output_index,
             'height': height,
+            'position': position,
+        }
+
+    async def sapling_get_best_anchor(self):
+        self.bump_cost(1.0)
+        try:
+            anchor = await self.daemon_request('getbestsaplinganchor')
+        except (DaemonError, RPCError):
+            tree_state = self.db.get_sapling_tree_state(self.db.db_height)
+            anchor = tree_state.get('latest_anchor')
+        return {
+            'anchor': anchor,
+            'height': self.db.db_height,
+            'block_hash': hash_to_hex_str(
+                (await self.db.fs_block_hashes(self.db.db_height, 1))[0]),
         }
 
     async def anchor_get_height(self, anchor_hex: str):
@@ -2582,5 +2807,3 @@ class PIVXSaplingElectrumX(ElectrumX):
                 ]
 
         return result
-
-

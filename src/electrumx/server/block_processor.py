@@ -897,10 +897,17 @@ class PIVXSaplingBlockProcessor(BlockProcessor):
         flush_data.sapling_nullifiers = self.sapling_nullifiers[:]
         flush_data.sapling_commitments = self.sapling_commitments[:]
         flush_data.sapling_anchors = self.sapling_anchors[:]
+        flush_data.sapling_delete_nullifiers = self.sapling_undo_nullifiers[:]
+        flush_data.sapling_delete_commitments = self.sapling_undo_commitments[:]
+        flush_data.sapling_delete_anchors = self.sapling_undo_anchors[:]
+        flush_data.sapling_backup_height_start = self.height + 1
         # Clear our caches after copying
         self.sapling_nullifiers.clear()
         self.sapling_commitments.clear()
         self.sapling_anchors.clear()
+        self.sapling_undo_nullifiers.clear()
+        self.sapling_undo_commitments.clear()
+        self.sapling_undo_anchors.clear()
         return flush_data
 
     def advance_txs(
@@ -924,9 +931,9 @@ class PIVXSaplingBlockProcessor(BlockProcessor):
                 tx_hash = tx.txid
 
                 # Index nullifiers from spends
-                for spend in tx.sapling_spends:
+                for spend_idx, spend in enumerate(tx.sapling_spends):
                     self.sapling_nullifiers.append(
-                        (spend.nullifier, tx_hash, height)
+                        (spend.nullifier, tx_hash, height, spend_idx)
                     )
                     # Track unique anchors
                     if spend.anchor not in seen_anchors:

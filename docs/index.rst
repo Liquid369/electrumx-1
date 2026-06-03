@@ -65,6 +65,7 @@ Documentation
    rpc-interface
    architecture
    pivx-sapling
+   pivx-sapling-spending
    authors
 
 Indices and tables

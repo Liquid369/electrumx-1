@@ -22,7 +22,7 @@ import attr
 from aiorpcx import run_in_thread, sleep
 
 import electrumx.lib.util as util
-from electrumx.lib.hash import hash_to_hex_str, HASHX_LEN
+from electrumx.lib.hash import double_sha256, hash_to_hex_str, HASHX_LEN
 from electrumx.lib.merkle import Merkle, MerkleCache
 from electrumx.lib.util import (
     formatted_time, pack_be_uint16, pack_be_uint32, pack_le_uint64, pack_le_uint32,
@@ -56,9 +56,13 @@ class FlushData:
     deletes = attr.ib()  # type: List[bytes]  # b'h' db keys, and b'u' db keys
     tip = attr.ib()
     # PIVX Sapling data (optional, defaults to empty lists)
-    sapling_nullifiers = attr.ib(factory=list)  # (nullifier, tx_hash, height)
+    sapling_nullifiers = attr.ib(factory=list)  # (nullifier, tx_hash, height, spend_index)
     sapling_commitments = attr.ib(factory=list)  # (cmu, tx_hash, idx, height)
     sapling_anchors = attr.ib(factory=list)  # (anchor, height)
+    sapling_delete_nullifiers = attr.ib(factory=list)
+    sapling_delete_commitments = attr.ib(factory=list)
+    sapling_delete_anchors = attr.ib(factory=list)
+    sapling_backup_height_start = attr.ib(default=None)
 
 
 COMP_TXID_LEN = 4
@@ -362,6 +366,21 @@ class DB:
             flush_data.sapling_commitments.clear()
             flush_data.sapling_anchors.clear()
 
+        sapling_delete_count = (len(flush_data.sapling_delete_nullifiers) +
+                                len(flush_data.sapling_delete_commitments) +
+                                len(flush_data.sapling_delete_anchors))
+        if sapling_delete_count > 0:
+            self.backup_sapling_data(
+                batch,
+                flush_data.sapling_delete_nullifiers,
+                flush_data.sapling_delete_commitments,
+                flush_data.sapling_delete_anchors,
+                flush_data.sapling_backup_height_start,
+            )
+            flush_data.sapling_delete_nullifiers.clear()
+            flush_data.sapling_delete_commitments.clear()
+            flush_data.sapling_delete_anchors.clear()
+
         if self.utxo_db.for_sync:
             block_count = flush_data.height - self.db_height
             tx_count = flush_data.tx_count - self.db_tx_count
@@ -618,6 +637,7 @@ class DB:
             self.utxo_flush_count = 0
             self.wall_time = 0
             self.first_sync = True
+            self.sapling_output_count = 0
         else:
             state = ast.literal_eval(state.decode())
             if not isinstance(state, dict):
@@ -640,6 +660,7 @@ class DB:
             self.utxo_flush_count = state['utxo_flush_count']
             self.wall_time = state['wall_time']
             self.first_sync = state['first_sync']
+            self.sapling_output_count = state.get('sapling_output_count', 0)
 
         # These are our state as we move ahead of DB state
         self.fs_height = self.db_height
@@ -759,6 +780,7 @@ class DB:
             'wall_time': self.wall_time,
             'first_sync': self.first_sync,
             'db_version': self.db_version,
+            'sapling_output_count': self.sapling_output_count,
         }
         batch.put(b'state', repr(state).encode())
 
@@ -844,40 +866,95 @@ class DB:
 
     # -- PIVX Sapling support
     # Key prefixes:
-    # 'N' + nullifier (32 bytes) -> txhash (32) + height (4)
-    # 'C' + commitment (32 bytes) -> txhash (32) + output_index (2) + height (4)
-    # 'A' + anchor (32 bytes) -> height (4)
+    # b'N' + nullifier (32 bytes) -> txhash (32) + height (4)
+    #                                  + spend_index (2)
+    # b'C' + commitment (32 bytes) -> txhash (32) + output_index (2)
+    #                                  + height (4) + position (8)
+    # b'P' + position (8, big-endian) -> txhash (32) + output_index (2)
+    #                                    + height (4) + commitment (32)
+    # b'A' + anchor (32 bytes) -> height (4)
+    # b'R' + root (32 bytes) -> tree_size (8) + height (4)
+
+    @staticmethod
+    def sapling_position_key(position: int) -> bytes:
+        return b'P' + position.to_bytes(8, 'big')
+
+    @staticmethod
+    def sapling_root_key(root: bytes) -> bytes:
+        return b'R' + root
+
+    @staticmethod
+    def sapling_leaf_hash(commitment: bytes) -> bytes:
+        return double_sha256(b'\x00' + commitment)
+
+    @classmethod
+    def sapling_parent_hash(cls, left: bytes, right: bytes) -> bytes:
+        return double_sha256(b'\x01' + left + right)
+
+    @classmethod
+    def sapling_empty_node(cls, level: int) -> bytes:
+        node = b'\0' * 32
+        for _ in range(level):
+            node = cls.sapling_parent_hash(node, node)
+        return node
 
     def flush_sapling_data(
             self,
             batch,
-            nullifiers: List[Tuple[bytes, bytes, int]],
+            nullifiers: List[Tuple[bytes, bytes, int, int]],
             commitments: List[Tuple[bytes, bytes, int, int]],
             anchors: List[Tuple[bytes, int]],
     ):
         '''Flush Sapling nullifiers, commitments, and anchors to the DB.
 
-        nullifiers: list of (nullifier, tx_hash, height)
+        nullifiers: list of (nullifier, tx_hash, height, spend_index)
         commitments: list of (commitment, tx_hash, output_index, height)
         anchors: list of (anchor, height)
         '''
         batch_put = batch.put
+        pending_outputs = {}
+        roots_by_height = {}
 
         # Write nullifiers
         # Key: b'N' + nullifier (32 bytes)
-        # Value: tx_hash (32 bytes) + height (4 bytes)
-        for nullifier, tx_hash, height in nullifiers:
+        # Value: tx_hash (32 bytes) + height (4 bytes) + spend_index (2 bytes)
+        for item in nullifiers:
+            if len(item) == 4:
+                nullifier, tx_hash, height, spend_index = item
+            else:
+                nullifier, tx_hash, height = item
+                spend_index = 0
             key = b'N' + nullifier
-            value = tx_hash + pack_be_uint32(height)
+            value = tx_hash + pack_be_uint32(height) + pack_be_uint16(spend_index)
             batch_put(key, value)
 
         # Write commitments
         # Key: b'C' + commitment (32 bytes)
         # Value: tx_hash (32 bytes) + output_index (2 bytes) + height (4 bytes)
+        #        + position (8 bytes)
         for commitment, tx_hash, output_index, height in commitments:
+            position = self.sapling_output_count
+            self.sapling_output_count += 1
             key = b'C' + commitment
-            value = tx_hash + pack_be_uint16(output_index) + pack_be_uint32(height)
+            value = (tx_hash + pack_be_uint16(output_index) +
+                     pack_be_uint32(height) + position.to_bytes(8, 'big'))
             batch_put(key, value)
+            batch_put(
+                self.sapling_position_key(position),
+                tx_hash + pack_be_uint16(output_index) +
+                pack_be_uint32(height) + commitment
+            )
+            pending_outputs[position] = (commitment, tx_hash, output_index,
+                                         height)
+            roots_by_height[height] = position + 1
+
+        for height in sorted(roots_by_height):
+            tree_size = roots_by_height[height]
+            commitments_for_root = self.sapling_commitments_for_tree(
+                tree_size, pending_outputs)
+            root = self.sapling_root_from_commitments(commitments_for_root)
+            batch_put(self.sapling_root_key(root),
+                      tree_size.to_bytes(8, 'big') + pack_be_uint32(height))
 
         # Write anchors
         # Key: b'A' + anchor (32 bytes)
@@ -893,6 +970,7 @@ class DB:
             nullifiers: List[bytes],
             commitments: List[bytes],
             anchors: List[bytes],
+            height_start: Optional[int] = None,
     ):
         '''Remove Sapling data during reorg/backup.
 
@@ -901,20 +979,42 @@ class DB:
         anchors: list of anchor bytes to remove
         '''
         batch_delete = batch.delete
+        min_removed_position = None
 
         for nullifier in nullifiers:
             batch_delete(b'N' + nullifier)
 
         for commitment in commitments:
+            value = self.utxo_db.get(b'C' + commitment)
+            if value is not None and len(value) >= 46:
+                position = int.from_bytes(value[38:46], 'big')
+                min_removed_position = (
+                    position if min_removed_position is None
+                    else min(min_removed_position, position)
+                )
+                batch_delete(self.sapling_position_key(position))
             batch_delete(b'C' + commitment)
 
         for anchor in anchors:
             batch_delete(b'A' + anchor)
 
-    def get_nullifier_spend(self, nullifier: bytes) -> Optional[Tuple[bytes, int]]:
+        if height_start is not None:
+            for key, value in self.utxo_db.iterator(prefix=b'A'):
+                height, = unpack_be_uint32(value[:4])
+                if height >= height_start:
+                    batch_delete(key)
+            for key, value in self.utxo_db.iterator(prefix=b'R'):
+                height, = unpack_be_uint32(value[8:12])
+                if height >= height_start:
+                    batch_delete(key)
+
+        if min_removed_position is not None:
+            self.sapling_output_count = min_removed_position
+
+    def get_nullifier_spend(self, nullifier: bytes) -> Optional[Tuple[bytes, int, int]]:
         '''Get the tx_hash and height where a nullifier was spent.
 
-        Returns (tx_hash, height) or None if not found.
+        Returns (tx_hash, height, spend_index) or None if not found.
         '''
         key = b'N' + nullifier
         value = self.utxo_db.get(key)
@@ -922,7 +1022,10 @@ class DB:
             return None
         tx_hash = value[:32]
         height, = unpack_be_uint32(value[32:36])
-        return tx_hash, height
+        spend_index = 0
+        if len(value) >= 38:
+            spend_index, = unpack_be_uint16_from(value, 36)
+        return tx_hash, height, spend_index
 
     def get_commitment_info(
             self, commitment: bytes
@@ -939,6 +1042,37 @@ class DB:
         output_index, = unpack_be_uint16_from(value, 32)
         height, = unpack_be_uint32(value[34:38])
         return tx_hash, output_index, height
+
+    def get_commitment_position_info(
+            self, commitment: bytes
+    ) -> Optional[Tuple[bytes, int, int, int]]:
+        '''Get commitment tx hash, output index, height, and global position.'''
+        value = self.utxo_db.get(b'C' + commitment)
+        if value is None:
+            return None
+        tx_hash = value[:32]
+        output_index, = unpack_be_uint16_from(value, 32)
+        height, = unpack_be_uint32(value[34:38])
+        position = None
+        if len(value) >= 46:
+            position = int.from_bytes(value[38:46], 'big')
+        return tx_hash, output_index, height, position
+
+    def get_sapling_output_by_position(
+            self, position: int, pending_outputs: Optional[Dict[int, tuple]] = None
+    ) -> Optional[Tuple[bytes, bytes, int, int, int]]:
+        '''Return (commitment, tx_hash, output_index, height, position).'''
+        if pending_outputs and position in pending_outputs:
+            commitment, tx_hash, output_index, height = pending_outputs[position]
+            return commitment, tx_hash, output_index, height, position
+        value = self.utxo_db.get(self.sapling_position_key(position))
+        if value is None:
+            return None
+        tx_hash = value[:32]
+        output_index, = unpack_be_uint16_from(value, 32)
+        height, = unpack_be_uint32(value[34:38])
+        commitment = value[38:70]
+        return commitment, tx_hash, output_index, height, position
 
     def get_anchor_height(self, anchor: bytes) -> Optional[int]:
         '''Get the height at which an anchor was valid.
@@ -1038,30 +1172,114 @@ class DB:
             'commitment_count': commitment_count,
             'latest_anchor': latest_anchor.hex() if latest_anchor else None,
             'latest_anchor_height': latest_anchor_height,
+            'tree_size': commitment_count,
         }
 
+    def get_sapling_root_info(self, root: bytes) -> Optional[Tuple[int, int]]:
+        value = self.utxo_db.get(self.sapling_root_key(root))
+        if value is None:
+            return None
+        tree_size = int.from_bytes(value[:8], 'big')
+        height, = unpack_be_uint32(value[8:12])
+        return tree_size, height
+
+    def sapling_commitments_for_tree(
+            self, tree_size: int,
+            pending_outputs: Optional[Dict[int, tuple]] = None
+    ) -> List[bytes]:
+        commitments = []
+        for position in range(tree_size):
+            info = self.get_sapling_output_by_position(position,
+                                                       pending_outputs)
+            if info is None:
+                raise self.DBError(
+                    f'missing Sapling output position {position:,d}')
+            commitment, _tx_hash, _output_index, _height, _position = info
+            commitments.append(commitment)
+        return commitments
+
+    @classmethod
+    def sapling_root_from_commitments(cls, commitments: List[bytes]) -> bytes:
+        if not commitments:
+            return cls.sapling_empty_node(0)
+        level = 0
+        nodes = [cls.sapling_leaf_hash(commitment)
+                 for commitment in commitments]
+        while len(nodes) > 1:
+            next_nodes = []
+            empty = cls.sapling_empty_node(level)
+            for n in range(0, len(nodes), 2):
+                left = nodes[n]
+                right = nodes[n + 1] if n + 1 < len(nodes) else empty
+                next_nodes.append(cls.sapling_parent_hash(left, right))
+            nodes = next_nodes
+            level += 1
+        return nodes[0]
+
+    @classmethod
+    def sapling_witness_path(
+            cls, commitments: List[bytes], position: int
+    ) -> List[dict]:
+        if position < 0 or position >= len(commitments):
+            raise IndexError('position outside commitment tree')
+        path = []
+        index = position
+        level = 0
+        nodes = [cls.sapling_leaf_hash(commitment)
+                 for commitment in commitments]
+        while len(nodes) > 1:
+            is_right = index & 1
+            sibling_index = index - 1 if is_right else index + 1
+            if sibling_index < len(nodes):
+                sibling = nodes[sibling_index]
+            else:
+                sibling = cls.sapling_empty_node(level)
+            path.append({
+                'position': 'left' if is_right else 'right',
+                'hash': sibling.hex(),
+            })
+            next_nodes = []
+            empty = cls.sapling_empty_node(level)
+            for n in range(0, len(nodes), 2):
+                left = nodes[n]
+                right = nodes[n + 1] if n + 1 < len(nodes) else empty
+                next_nodes.append(cls.sapling_parent_hash(left, right))
+            nodes = next_nodes
+            index >>= 1
+            level += 1
+        return path
+
     def get_sapling_witness(
-            self,
-            commitment: bytes,
-            anchor_height: int
-    ) -> Optional[Tuple[int, List[bytes], bytes]]:
-        '''Get Merkle witness for a commitment at a given anchor height.
-
-        This requires maintaining an incremental Merkle tree which is
-        not yet implemented. Returns None for now.
-
-        For full spending support, the wallet should use a full node
-        or this method needs to be implemented with incremental tree state.
-
-        Returns (position, path, anchor) or None if not available.
-        '''
-        # TODO: Implement incremental Merkle tree for witness generation
-        # This requires:
-        # 1. Storing the commitment tree state at each block
-        # 2. Building authentication paths from stored state
-        # 3. Computing the correct anchor for the given height
-        #
-        # For now, return None to indicate witness not available
-        return None
-
-
+            self, position: int, root: Optional[bytes] = None
+    ) -> Optional[dict]:
+        '''Return an anchor-bound witness for a Sapling output position.'''
+        if position < 0:
+            raise self.DBError(f'invalid Sapling output position {position:,d}')
+        if root is None:
+            tree_size = self.sapling_output_count
+            root = self.sapling_root_from_commitments(
+                self.sapling_commitments_for_tree(tree_size))
+            height = self.db_height
+        else:
+            info = self.get_sapling_root_info(root)
+            if info is None:
+                return None
+            tree_size, height = info
+        if position >= tree_size:
+            return None
+        output_info = self.get_sapling_output_by_position(position)
+        if output_info is None:
+            return None
+        commitment, _tx_hash, _output_index, _height, _position = output_info
+        commitments = self.sapling_commitments_for_tree(tree_size)
+        calculated_root = self.sapling_root_from_commitments(commitments)
+        if calculated_root != root:
+            raise self.DBError('indexed Sapling root mismatch for witness')
+        return {
+            'anchor': root.hex(),
+            'root': root.hex(),
+            'anchor_height': height,
+            'position': position,
+            'path': self.sapling_witness_path(commitments, position),
+            'commitment': commitment.hex(),
+        }
