@@ -191,6 +191,12 @@ class FixtureDaemon:
         return [self.blocks_by_hash[block_hash]['raw']
                 for block_hash in block_hashes]
 
+    async def getnetworkinfo(self):
+        return {
+            'version': 5060100,
+            'subversion': '/PIVX Core:5.6.1/',
+        }
+
 
 def make_session(db, daemon):
     session = object.__new__(PIVXSaplingElectrumX)
@@ -201,6 +207,11 @@ def make_session(db, daemon):
     session.session_mgr._method_counts = defaultdict(int)
     session.logger = logging.getLogger('test-pivx-sapling')
     session.bump_cost = lambda _cost: None
+
+    async def daemon_request(method, *args):
+        return await getattr(daemon, method)(*args)
+
+    session.daemon_request = daemon_request
     return session
 
 
@@ -241,20 +252,43 @@ def test_sapling_capabilities_document_cake_wallet_v1_contract():
     assert capabilities['success'] is True
     assert capabilities['contract'] == PIVX_SAPLING_RPC_CONTRACT
     assert capabilities['version'] == 1
+    assert capabilities['server_version']
+    assert capabilities['pivx_core_version'] == 'PIVX Core:5.6.1'
+    assert capabilities['network'] == 'mainnet'
+    assert capabilities['sapling_activation_height'] == 2700500
+    assert capabilities['max_block_range'] == PIVX_SAPLING_MAX_BLOCK_RANGE
     assert capabilities['range_response'] == 'envelope'
+    assert capabilities['release_contract_ready'] is True
+    assert capabilities['features'] == {
+        'global_output_positions': True,
+        'block_hashes': True,
+        'structured_errors': True,
+    }
+    assert capabilities['range_response_format'][
+        'global_output_positions'] is True
+    assert capabilities['range_response_format']['block_hashes'] is True
     assert 'unsupported_method' in capabilities['range_error_types']
     for method in (
-            'blockchain.sapling.capabilities',
             'blockchain.sapling.get_block_range',
-            'blockchain.sapling.get_nullifier_status',
-            'blockchain.sapling.get_commitment_info',
             'blockchain.sapling.get_best_anchor',
-            'blockchain.sapling.get_anchor_height',
-            'blockchain.sapling.get_tree_state',
-            'blockchain.sapling.get_witness'):
+            'blockchain.sapling.get_witness',
+            'blockchain.sapling.get_nullifier_status',
+            'blockchain.sapling.get_commitment_info'):
+        assert method in capabilities['required_methods']
         assert method in capabilities['methods']
     assert 'get_block_range' in capabilities['aliases'][
         'blockchain.sapling.get_block_range']
+
+
+def test_sapling_capabilities_do_not_advertise_v1_if_not_release_ready():
+    session = make_session(make_sapling_db(), FixtureDaemon([]))
+    session.SAPLING_METHODS = ['blockchain.sapling.get_block_range']
+
+    capabilities = run(session.sapling_capabilities())
+
+    assert capabilities['success'] is False
+    assert capabilities['contract'] is None
+    assert capabilities['release_contract_ready'] is False
 
 
 def test_sapling_capabilities_request_handler_is_awaitable():

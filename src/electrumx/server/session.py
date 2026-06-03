@@ -50,6 +50,18 @@ BAD_REQUEST = 1
 DAEMON_ERROR = 2
 PIVX_SAPLING_MAX_BLOCK_RANGE = 100
 PIVX_SAPLING_RPC_CONTRACT = 'pivx.sapling.electrumx.v1'
+PIVX_SAPLING_RELEASE_METHODS = [
+    'blockchain.sapling.get_block_range',
+    'blockchain.sapling.get_best_anchor',
+    'blockchain.sapling.get_witness',
+    'blockchain.sapling.get_nullifier_status',
+    'blockchain.sapling.get_commitment_info',
+]
+PIVX_SAPLING_RELEASE_FEATURES = {
+    'global_output_positions': True,
+    'block_hashes': True,
+    'structured_errors': True,
+}
 
 
 def scripthash_to_hashX(scripthash):
@@ -2216,16 +2228,39 @@ class PIVXSaplingElectrumX(ElectrumX):
         )
 
     async def sapling_capabilities(self):
+        features = dict(PIVX_SAPLING_RELEASE_FEATURES)
+        range_response_format = {
+            'type': 'envelope',
+            'global_output_positions': True,
+            'block_hashes': True,
+            'structured_errors': True,
+            'empty_success': True,
+            'partial_failures': True,
+        }
+        release_contract_ready = (
+            all(method in self.SAPLING_METHODS
+                for method in PIVX_SAPLING_RELEASE_METHODS)
+            and all(features.values())
+            and range_response_format['global_output_positions']
+            and range_response_format['block_hashes']
+        )
         return {
-            'success': True,
-            'contract': PIVX_SAPLING_RPC_CONTRACT,
+            'success': release_contract_ready,
+            'contract': (PIVX_SAPLING_RPC_CONTRACT
+                         if release_contract_ready else None),
             'version': 1,
+            'server_version': electrumx.version,
+            'pivx_core_version': await self._sapling_pivx_core_version(),
             'coin': self.coin.SHORTNAME,
             'network': self.coin.NET,
             'sapling_activation_height':
                 getattr(self.coin, 'SAPLING_START_HEIGHT', None),
             'max_block_range': PIVX_SAPLING_MAX_BLOCK_RANGE,
+            'required_methods': PIVX_SAPLING_RELEASE_METHODS,
             'range_response': 'envelope',
+            'range_response_format': range_response_format,
+            'features': features,
+            'release_contract_ready': release_contract_ready,
             'range_error_types': [
                 'invalid_range',
                 'daemon_error',
@@ -2239,6 +2274,26 @@ class PIVXSaplingElectrumX(ElectrumX):
             'methods': self.SAPLING_METHODS,
             'aliases': self.SAPLING_METHOD_ALIASES,
         }
+
+    async def _sapling_pivx_core_version(self):
+        try:
+            network_info = await self.daemon_request('getnetworkinfo')
+        except (AttributeError, DaemonError, RPCError):
+            return 'unknown'
+
+        subversion = network_info.get('subversion')
+        if isinstance(subversion, str) and subversion:
+            return subversion.strip('/') or subversion
+
+        version = network_info.get('version')
+        try:
+            version = int(version)
+        except (TypeError, ValueError):
+            return 'unknown'
+        major = version // 10_000
+        minor = (version % 10_000) // 100
+        revision = version % 100
+        return f'{major:d}.{minor:d}.{revision:d}'
 
     def sapling_method_not_supported(self, method):
         return {
