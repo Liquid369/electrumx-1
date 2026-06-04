@@ -311,6 +311,105 @@ without scanning outputs.
      "count": 1
    }
 
+blockchain.sapling.get_nullifier_status
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Check whether a single Sapling nullifier is indexed as spent.  This is the
+preferred v1 status method for Cake Wallet live helper validation.
+
+**Parameters:**
+
+* ``nullifier_hex`` (string): 32-byte nullifier as hex
+
+**Unknown/unspent response:**
+
+.. code-block:: json
+
+   {
+     "spent": false,
+     "tx_hash": null,
+     "txid": null,
+     "height": null,
+     "spend_index": null
+   }
+
+**Spent response:**
+
+.. code-block:: json
+
+   {
+     "spent": true,
+     "tx_hash": "...",
+     "txid": "...",
+     "height": 5057530,
+     "spend_index": 0
+   }
+
+blockchain.sapling.get_commitment_info
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Return indexed transaction and global-position metadata for one Sapling
+commitment.  Unknown commitments return a structured absent response, not
+``null``.
+
+**Parameters:**
+
+* ``commitment_hex`` (string): 32-byte commitment as hex
+
+**Unknown response:**
+
+.. code-block:: json
+
+   {
+     "exists": false,
+     "txid": null,
+     "output_index": null,
+     "height": null,
+     "position": null
+   }
+
+**Known response:**
+
+.. code-block:: json
+
+   {
+     "exists": true,
+     "txid": "...",
+     "output_index": 0,
+     "height": 5057529,
+     "position": 1234
+   }
+
+blockchain.sapling.get_best_anchor
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Return the best indexed Sapling anchor available to light-wallet send logic.
+The method returns a structured response even when no Sapling anchor is indexed.
+
+**Returns with an indexed anchor:**
+
+.. code-block:: json
+
+   {
+     "available": true,
+     "anchor": "...",
+     "height": 5057529,
+     "anchor_height": 5057529,
+     "block_hash": "..."
+   }
+
+**Returns before any Sapling anchor is indexed:**
+
+.. code-block:: json
+
+   {
+     "available": false,
+     "anchor": null,
+     "height": 10000,
+     "anchor_height": null,
+     "block_hash": "..."
+   }
+
 blockchain.nullifier.get_spend
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -338,34 +437,32 @@ blockchain.sapling.get_witness
 
 Return an anchor-bound witness for a Sapling output position or commitment.
 
+**Current production status**: unavailable in this ElectrumX build.  Earlier
+builds returned witnesses from an internal placeholder tree based on
+``double_sha256``.  Those sibling nodes are not canonical PIVX Sapling note
+commitment tree nodes and must not be used for spend construction.  The server
+now fails closed until a PIVX Core/librustpivx-compatible witness backend is
+implemented.
+
 **Parameters:**
 
 * ``position`` (int or 32-byte commitment hex): Global Sapling output position,
   or a commitment whose global position is indexed.
-* ``anchor_hex`` (string, optional): 32-byte Sapling root/anchor.  If supplied,
-  the witness is generated against that exact root.
+* ``anchor_hex`` (string, optional): 32-byte Sapling root/anchor.
 
-**Returns:**
+**Current response:**
 
-.. code-block:: json
+Raises a JSON-RPC bad-request error with a message beginning:
 
-   {
-     "anchor": "...",
-     "root": "...",
-     "anchor_height": 5057529,
-     "position": 1234,
-     "note_position": 1234,
-     "path": [
-       {
-         "position": "left",
-         "hash": "..."
-       }
-     ],
-     "commitment": "..."
-   }
+.. code-block:: text
 
-Clients must verify that the path recomputes ``root`` from ``commitment`` and
-``note_position`` before using the witness for spending.
+   canonical_witness_unavailable: PIVX Sapling witnesses require canonical Sapling note-commitment tree nodes
+
+A future witness-capable implementation must return leaf-to-root sibling nodes
+encoded exactly as canonical 32-byte little-endian PIVX Sapling
+``sapling::Node::to_bytes()`` values.  Full 32-level paths are preferred; compact
+paths are only acceptable if missing upper levels are canonical Sapling empty
+roots for the omitted levels.
 
 blockchain.sapling.get_tree_state
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

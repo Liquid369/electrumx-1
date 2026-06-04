@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 from unittest import mock
 
-from aiorpcx import Request
+from aiorpcx import Request, RPCError
 
 from electrumx.lib.coins import Pivx, PivxTestnet
 from electrumx.lib import tx as tx_lib
@@ -301,13 +301,13 @@ def test_client_can_rescan_full_pivx_rollback_boundary_with_hashes():
     assert mismatches == [block['height']]
 
 
-def test_sapling_capabilities_document_cake_wallet_v1_contract():
+def test_sapling_capabilities_do_not_advertise_release_ready_without_witness_backend():
     session = make_session(make_sapling_db(), FixtureDaemon([]))
 
     capabilities = run(session.sapling_capabilities())
 
-    assert capabilities['success'] is True
-    assert capabilities['contract'] == PIVX_SAPLING_RPC_CONTRACT
+    assert capabilities['success'] is False
+    assert capabilities['contract'] is None
     assert capabilities['version'] == 1
     assert capabilities['server_version']
     assert capabilities['pivx_core_version'] == 'PIVX Core:5.6.1'
@@ -315,16 +315,20 @@ def test_sapling_capabilities_document_cake_wallet_v1_contract():
     assert capabilities['sapling_activation_height'] == 2700500
     assert capabilities['max_block_range'] == PIVX_SAPLING_MAX_BLOCK_RANGE
     assert capabilities['range_response'] == 'envelope'
-    assert capabilities['release_contract_ready'] is True
+    assert capabilities['release_contract_ready'] is False
     assert capabilities['features'] == {
         'global_output_positions': True,
         'block_hashes': True,
         'structured_errors': True,
+        'canonical_witnesses': False,
     }
     assert capabilities['range_response_format'][
         'global_output_positions'] is True
     assert capabilities['range_response_format']['block_hashes'] is True
     assert 'unsupported_method' in capabilities['range_error_types']
+    assert capabilities['witness_response'] == 'unavailable'
+    assert 'canonical_witness_unavailable' in capabilities[
+        'witness_error_types']
     for method in (
             'blockchain.sapling.get_block_range',
             'blockchain.sapling.get_best_anchor',
@@ -410,8 +414,9 @@ def test_sapling_capabilities_request_handler_is_awaitable():
     response = run(session.handle_request(
         Request('blockchain.sapling.capabilities', [])))
 
-    assert response['success'] is True
-    assert response['contract'] == PIVX_SAPLING_RPC_CONTRACT
+    assert response['success'] is False
+    assert response['contract'] is None
+    assert response['features']['canonical_witnesses'] is False
 
 
 def test_sapling_unknown_contract_method_returns_structured_error():
@@ -690,21 +695,7 @@ def test_get_block_range_returns_canonical_output_order_with_positions():
     ]
 
 
-def verify_indexed_witness(commitment_hex, position, path, root_hex):
-    node = DB.sapling_leaf_hash(bytes.fromhex(commitment_hex))
-    index = position
-    for item in path:
-        sibling = bytes.fromhex(item['hash'])
-        if item['position'] == 'left':
-            node = DB.sapling_parent_hash(sibling, node)
-        else:
-            node = DB.sapling_parent_hash(node, sibling)
-        index >>= 1
-    assert index == 0
-    return node.hex() == root_hex
-
-
-def test_sapling_witness_path_verifies_against_requested_anchor():
+def test_sapling_witness_fails_closed_without_canonical_backend():
     db = make_sapling_db()
     db.db_height = 400
     commitments = [bytes([n]) * 32 for n in range(1, 5)]
@@ -718,14 +709,29 @@ def test_sapling_witness_path_verifies_against_requested_anchor():
     root = DB.sapling_root_from_commitments(commitments)
     session = make_session(db, FixtureDaemon([]))
 
-    witness = run(session.sapling_get_witness(2, root.hex()))
+    try:
+        run(session.sapling_get_witness(2, root.hex()))
+    except RPCError as e:
+        assert 'canonical_witness_unavailable' in e.message
+    else:
+        raise AssertionError('non-canonical placeholder witness was returned')
 
-    assert witness['anchor'] == root.hex()
-    assert witness['root'] == root.hex()
-    assert witness['anchor_height'] == 400
-    assert witness['position'] == 2
-    assert witness['note_position'] == 2
-    assert witness['commitment'] == commitments[2].hex()
-    assert verify_indexed_witness(
-        witness['commitment'], witness['position'], witness['path'],
-        witness['root'])
+
+def test_sapling_commitment_only_witness_fails_closed_without_backend():
+    db = make_sapling_db()
+    db.db_height = 400
+    commitment = b'c' * 32
+    db.flush_sapling_data(
+        db.utxo_db,
+        [],
+        [(commitment, b't' * 32, 0, 400)],
+        [],
+    )
+    session = make_session(db, FixtureDaemon([]))
+
+    try:
+        run(session.sapling_get_witness(commitment.hex()))
+    except RPCError as e:
+        assert 'canonical_witness_unavailable' in e.message
+    else:
+        raise AssertionError('commitment-only placeholder witness was returned')

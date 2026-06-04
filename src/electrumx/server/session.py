@@ -61,6 +61,7 @@ PIVX_SAPLING_RELEASE_FEATURES = {
     'global_output_positions': True,
     'block_hashes': True,
     'structured_errors': True,
+    'canonical_witnesses': False,
 }
 
 
@@ -2295,6 +2296,12 @@ class PIVXSaplingElectrumX(ElectrumX):
                 'unsupported_method',
                 'server_error',
             ],
+            'witness_response': 'unavailable',
+            'witness_error_types': [
+                'canonical_witness_unavailable',
+                'commitment_not_found',
+                'invalid_anchor',
+            ],
             'methods': self.SAPLING_METHODS,
             'aliases': self.SAPLING_METHOD_ALIASES,
         }
@@ -2672,7 +2679,14 @@ class PIVXSaplingElectrumX(ElectrumX):
             position,
             anchor_hex: str = None
     ):
-        '''Return an anchor-bound witness for a Sapling output position.'''
+        '''Return an anchor-bound witness for a Sapling output position.
+
+        The legacy implementation built witnesses from a local double-SHA256
+        placeholder tree.  Those nodes are not canonical Sapling field
+        encodings and cannot be used by PIVX Core/librustpivx spend builders.
+        Until ElectrumX has a real Sapling note-commitment-tree backend, fail
+        explicitly instead of returning an invalid witness.
+        '''
         self.bump_cost(5.0)  # Expensive operation
 
         if isinstance(position, str) and len(position) == 64:
@@ -2689,12 +2703,13 @@ class PIVXSaplingElectrumX(ElectrumX):
             assert_hex_str(anchor_hex)
             if len(anchor_hex) != 64:
                 raise RPCError(BAD_REQUEST, 'anchor must be 32 bytes (64 hex)')
-            anchor = bytes.fromhex(anchor_hex)
+            _anchor = bytes.fromhex(anchor_hex)
 
-        witness = self.db.get_sapling_witness(position, anchor)
-        if witness is None:
-            raise RPCError(BAD_REQUEST, f'witness not found for position {position}')
-        return witness
+        raise RPCError(
+            BAD_REQUEST,
+            'canonical_witness_unavailable: PIVX Sapling witnesses require '
+            'canonical Sapling note-commitment tree nodes; this ElectrumX '
+            'build does not include a PIVX Core/librustpivx witness backend')
 
     async def sapling_get_witnesses(self, positions, anchor_hex: str = None):
         if not isinstance(positions, list):
