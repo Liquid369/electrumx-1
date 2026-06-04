@@ -428,6 +428,93 @@ def test_sapling_unknown_contract_method_returns_structured_error():
     assert 'blockchain.sapling.get_block_range' in response['supported_methods']
 
 
+def test_sapling_best_anchor_falls_back_when_daemon_method_missing():
+    block = load_block_fixture('pivx_mainnet_2703076.json')
+    db = make_sapling_db()
+    db.db_height = block['height']
+    anchor = b'a' * 32
+    db.flush_sapling_data(db.utxo_db, [], [], [(anchor, block['height'])])
+    session = make_session(db, FixtureDaemon([block]))
+
+    response = run(session.sapling_get_best_anchor())
+
+    assert response == {
+        'available': True,
+        'anchor': anchor.hex(),
+        'height': block['height'],
+        'anchor_height': block['height'],
+        'block_hash': block['hash'],
+    }
+
+
+def test_sapling_best_anchor_returns_structured_response_without_anchor():
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db()
+    db.db_height = block['height']
+    session = make_session(db, FixtureDaemon([block]))
+
+    response = run(session.sapling_get_best_anchor())
+
+    assert response == {
+        'available': False,
+        'anchor': None,
+        'height': block['height'],
+        'anchor_height': None,
+        'block_hash': block['hash'],
+    }
+
+
+def test_unknown_commitment_info_returns_structured_absent_response():
+    db = make_sapling_db()
+    session = make_session(db, FixtureDaemon([]))
+
+    response = run(session.commitment_get_info('00' * 32))
+
+    assert response == {
+        'exists': False,
+        'txid': None,
+        'output_index': None,
+        'height': None,
+        'position': None,
+    }
+
+
+def test_unknown_nullifier_status_returns_structured_unspent_response():
+    db = make_sapling_db()
+    session = make_session(db, FixtureDaemon([]))
+
+    response = run(session.sapling_get_nullifier_status('00' * 32))
+
+    assert response == {
+        'spent': False,
+        'tx_hash': None,
+        'txid': None,
+        'height': None,
+        'spend_index': None,
+    }
+
+
+def test_live_helper_methods_do_not_leak_internal_errors():
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db()
+    db.db_height = block['height']
+    session = make_session(db, FixtureDaemon([block]))
+    session.set_request_handlers((1, 4))
+
+    best_anchor = run(session.handle_request(
+        Request('blockchain.sapling.get_best_anchor', [])))
+    nullifier_status = run(session.handle_request(Request(
+        'blockchain.sapling.get_nullifier_status', ['00' * 32])))
+    commitment_info = run(session.handle_request(Request(
+        'blockchain.sapling.get_commitment_info', ['00' * 32])))
+
+    assert best_anchor['available'] is False
+    assert best_anchor['anchor'] is None
+    assert best_anchor['block_hash'] == block['hash']
+    assert nullifier_status['spent'] is False
+    assert commitment_info['exists'] is False
+
+
 def test_get_block_range_success_empty_scanned_range_is_complete():
     block = load_block_fixture('pivx_mainnet_10000.json')
     db = make_sapling_db()

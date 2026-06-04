@@ -2796,7 +2796,13 @@ class PIVXSaplingElectrumX(ElectrumX):
     async def sapling_get_nullifier_status(self, nullifier_hex: str):
         result = await self.nullifier_get_spend(nullifier_hex)
         if result is None:
-            return {'spent': False}
+            return {
+                'spent': False,
+                'tx_hash': None,
+                'txid': None,
+                'height': None,
+                'spend_index': None,
+            }
         return {
             'spent': True,
             'tx_hash': result['txid'],
@@ -2843,7 +2849,13 @@ class PIVXSaplingElectrumX(ElectrumX):
         result = self.db.get_commitment_info(commitment)
 
         if result is None:
-            return None
+            return {
+                'exists': False,
+                'txid': None,
+                'output_index': None,
+                'height': None,
+                'position': None,
+            }
 
         tx_hash, output_index, height = result
         position = None
@@ -2851,6 +2863,7 @@ class PIVXSaplingElectrumX(ElectrumX):
         if position_info is not None:
             position = position_info[3]
         return {
+            'exists': True,
             'txid': hash_to_hex_str(tx_hash),
             'output_index': output_index,
             'height': height,
@@ -2859,17 +2872,35 @@ class PIVXSaplingElectrumX(ElectrumX):
 
     async def sapling_get_best_anchor(self):
         self.bump_cost(1.0)
+        tree_state = self.db.get_sapling_tree_state(self.db.db_height)
+        anchor_height = tree_state.get('latest_anchor_height')
         try:
             anchor = await self.daemon_request('getbestsaplinganchor')
-        except (DaemonError, RPCError):
-            tree_state = self.db.get_sapling_tree_state(self.db.db_height)
+        except (AttributeError, DaemonError, RPCError):
             anchor = tree_state.get('latest_anchor')
+        if anchor is None:
+            anchor_height = None
         return {
+            'available': anchor is not None,
             'anchor': anchor,
             'height': self.db.db_height,
-            'block_hash': hash_to_hex_str(
-                (await self.db.fs_block_hashes(self.db.db_height, 1))[0]),
+            'anchor_height': anchor_height,
+            'block_hash': await self._sapling_best_anchor_block_hash(),
         }
+
+    async def _sapling_best_anchor_block_hash(self):
+        try:
+            return hash_to_hex_str(
+                (await self.db.fs_block_hashes(self.db.db_height, 1))[0])
+        except (AttributeError, self.db.DBError, IndexError):
+            pass
+
+        try:
+            block_hashes = await self.session_mgr.daemon.block_hex_hashes(
+                self.db.db_height, 1)
+        except (AttributeError, DaemonError, RPCError):
+            return None
+        return block_hashes[0] if block_hashes else None
 
     async def anchor_get_height(self, anchor_hex: str):
         '''Get the height at which a Sapling anchor was valid.
