@@ -337,6 +337,59 @@ def test_sapling_capabilities_document_cake_wallet_v1_contract():
         'blockchain.sapling.get_block_range']
 
 
+def test_sapling_cake_wallet_aliases_are_advertised_and_registered():
+    session = make_session(make_sapling_db(), FixtureDaemon([]))
+    session.set_request_handlers((1, 4))
+
+    expected_aliases = {
+        'blockchain.sapling.capabilities': [
+            'blockchain.sapling.get_capabilities',
+            'server.sapling.capabilities',
+            'sapling.capabilities',
+            'get_capabilities',
+        ],
+        'blockchain.sapling.get_block_range': [
+            'blockchain.sapling.get_blocks',
+            'get_block_range',
+            'sapling.get_block_range',
+        ],
+        'blockchain.sapling.get_nullifier_status': [
+            'blockchain.sapling.check_nullifier',
+            'sapling.get_nullifier_status',
+        ],
+        'blockchain.sapling.get_commitment_info': [
+            'blockchain.sapling.get_commitment',
+            'blockchain.commitment.get_info',
+            'sapling.get_commitment_info',
+        ],
+        'blockchain.sapling.get_best_anchor': [
+            'blockchain.sapling.best_anchor',
+            'sapling.get_best_anchor',
+        ],
+        'blockchain.sapling.get_anchor_height': [
+            'blockchain.anchor.get_height',
+            'sapling.get_anchor_height',
+        ],
+        'blockchain.sapling.get_tree_state': [
+            'blockchain.sapling.get_treestate',
+            'sapling.get_tree_state',
+        ],
+        'blockchain.sapling.get_witness': [
+            'sapling.get_witness',
+        ],
+    }
+
+    aliases = run(session.sapling_capabilities())['aliases']
+    for canonical, method_aliases in expected_aliases.items():
+        assert aliases[canonical] == method_aliases
+        canonical_handler = session.request_handlers[canonical]
+        for alias in method_aliases:
+            assert session.request_handlers[alias] == canonical_handler
+    assert session.request_handlers['blockchain.nullifier.get_spend'] == (
+        session.nullifier_get_spend
+    )
+
+
 def test_sapling_capabilities_do_not_advertise_v1_if_not_release_ready():
     session = make_session(make_sapling_db(), FixtureDaemon([]))
     session.SAPLING_METHODS = ['blockchain.sapling.get_block_range']

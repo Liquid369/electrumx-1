@@ -84,6 +84,63 @@ See the comprehensive technical specification:
 API Reference
 -------------
 
+PIVX Sapling ElectrumX v1 Contract
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Cake Wallet should probe ``blockchain.sapling.capabilities`` before enabling
+Sapling sync/send routes.  A production-ready server returns:
+
+.. code-block:: json
+
+   {
+     "success": true,
+     "contract": "pivx.sapling.electrumx.v1",
+     "version": 1,
+     "network": "mainnet",
+     "sapling_activation_height": 2700500,
+     "max_block_range": 100,
+     "range_response": "envelope",
+     "features": {
+       "global_output_positions": true,
+       "block_hashes": true,
+       "structured_errors": true
+     },
+     "release_contract_ready": true
+   }
+
+The capability probe also advertises supported methods, aliases, range response
+format details, and structured range error types.  Cake Wallet treats legacy
+servers without this v1 release contract as compatibility-only.
+
+Production v1 method surface:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 66
+
+   * - Canonical method
+     - Registered aliases
+   * - ``blockchain.sapling.capabilities``
+     - ``blockchain.sapling.get_capabilities``, ``server.sapling.capabilities``, ``sapling.capabilities``, ``get_capabilities``
+   * - ``blockchain.sapling.get_block_range``
+     - ``blockchain.sapling.get_blocks``, ``sapling.get_block_range``, ``get_block_range``
+   * - ``blockchain.sapling.get_nullifier_status``
+     - ``blockchain.sapling.check_nullifier``, ``sapling.get_nullifier_status``
+   * - ``blockchain.sapling.get_commitment_info``
+     - ``blockchain.sapling.get_commitment``, ``blockchain.commitment.get_info``, ``sapling.get_commitment_info``
+   * - ``blockchain.sapling.get_best_anchor``
+     - ``blockchain.sapling.best_anchor``, ``sapling.get_best_anchor``
+   * - ``blockchain.sapling.get_anchor_height``
+     - ``blockchain.anchor.get_height``, ``sapling.get_anchor_height``
+   * - ``blockchain.sapling.get_tree_state``
+     - ``blockchain.sapling.get_treestate``, ``sapling.get_tree_state``
+   * - ``blockchain.sapling.get_witness``
+     - ``sapling.get_witness``
+
+``blockchain.nullifier.get_spend`` remains registered as a legacy lookup route.
+It is not advertised as a strict alias for ``get_nullifier_status`` because its
+unspent response is ``null`` rather than ``{"spent": false}``.
+
 blockchain.sapling.get_block_range
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -257,7 +314,8 @@ without scanning outputs.
 blockchain.nullifier.get_spend
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Check if a specific nullifier has been spent.
+Legacy lookup for the transaction that spent a specific nullifier.  Prefer
+``blockchain.sapling.get_nullifier_status`` for Cake Wallet v1 status checks.
 
 **Parameters:**
 
@@ -268,10 +326,12 @@ Check if a specific nullifier has been spent.
 .. code-block:: json
 
    {
-     "spent": true,
      "txid": "...",
-     "height": 5057530
+     "height": 5057530,
+     "spend_index": 0
    }
+
+Returns ``null`` when the nullifier is not indexed as spent.
 
 blockchain.sapling.get_witness
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -322,9 +382,12 @@ Get commitment tree state at height.
 
    {
      "height": 5057529,
-     "hash": "...",
+     "block_hash": "...",
      "tree_size": 12345,
-     "sapling_tree": "..."
+     "commitment_count": 12345,
+     "nullifier_count": 123,
+     "latest_anchor": "...",
+     "latest_anchor_height": 5057529
    }
 
 blockchain.transaction.get_sapling
@@ -414,7 +477,7 @@ Recommended approach for light wallets:
 1. **Initial Sync**:
    
    * Start from Sapling activation (block 2,700,500)
-   * Fetch 1000-block batches using ``get_block_range``
+   * Fetch at most 100-block batches using ``get_block_range``
    * Trial decrypt all outputs
    * Track all nullifiers for owned notes
    * Store wallet state to disk after each batch
@@ -456,7 +519,7 @@ Example: Cake Wallet Integration
        def __init__(self, electrum_server):
            self.server = electrum_server
            self.activation = 2700500
-           self.batch_size = 1000
+           self.batch_size = 100
        
        async def sync(self):
            """Full wallet sync"""
@@ -472,13 +535,15 @@ Example: Cake Wallet Integration
                end = min(start + self.batch_size - 1, tip)
                
                # Get compact blocks
-               blocks = await self.server.request(
+               response = await self.server.request(
                    'blockchain.sapling.get_block_range',
                    start, end
                )
+               if not response['success'] or not response['complete']:
+                   raise RuntimeError(response['error'])
                
                # Process each block
-               for block in blocks:
+               for block in response['blocks']:
                    self.process_block(block)
                
                # Save progress

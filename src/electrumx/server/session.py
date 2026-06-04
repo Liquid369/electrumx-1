@@ -2109,6 +2109,8 @@ class PIVXSaplingElectrumX(ElectrumX):
         'blockchain.sapling.capabilities': [
             'blockchain.sapling.get_capabilities',
             'server.sapling.capabilities',
+            'sapling.capabilities',
+            'get_capabilities',
         ],
         'blockchain.sapling.get_block_range': [
             'blockchain.sapling.get_blocks',
@@ -2117,23 +2119,29 @@ class PIVXSaplingElectrumX(ElectrumX):
         ],
         'blockchain.sapling.get_nullifier_status': [
             'blockchain.sapling.check_nullifier',
-            'blockchain.nullifier.get_spend',
+            'sapling.get_nullifier_status',
         ],
         'blockchain.sapling.check_nullifiers': [],
         'blockchain.sapling.get_commitment_info': [
             'blockchain.sapling.get_commitment',
             'blockchain.commitment.get_info',
+            'sapling.get_commitment_info',
         ],
         'blockchain.sapling.get_best_anchor': [
             'blockchain.sapling.best_anchor',
+            'sapling.get_best_anchor',
         ],
         'blockchain.sapling.get_anchor_height': [
             'blockchain.anchor.get_height',
+            'sapling.get_anchor_height',
         ],
         'blockchain.sapling.get_tree_state': [
             'blockchain.sapling.get_treestate',
+            'sapling.get_tree_state',
         ],
-        'blockchain.sapling.get_witness': [],
+        'blockchain.sapling.get_witness': [
+            'sapling.get_witness',
+        ],
         'blockchain.sapling.get_witnesses': [],
     }
 
@@ -2159,10 +2167,16 @@ class PIVXSaplingElectrumX(ElectrumX):
                 self.sapling_capabilities,
             'server.sapling.capabilities':
                 self.sapling_capabilities,
+            'sapling.capabilities':
+                self.sapling_capabilities,
+            'get_capabilities':
+                self.sapling_capabilities,
             # Core Cake Wallet APIs
             'blockchain.sapling.get_outputs':
                 self.sapling_get_outputs,
             'blockchain.sapling.get_witness':
+                self.sapling_get_witness,
+            'sapling.get_witness':
                 self.sapling_get_witness,
             'blockchain.sapling.get_witnesses':
                 self.sapling_get_witnesses,
@@ -2172,11 +2186,15 @@ class PIVXSaplingElectrumX(ElectrumX):
                 self.sapling_get_nullifier_status,
             'blockchain.sapling.check_nullifier':
                 self.sapling_get_nullifier_status,
+            'sapling.get_nullifier_status':
+                self.sapling_get_nullifier_status,
             'blockchain.sapling.check_nullifiers':
                 self.sapling_check_nullifiers,
             'blockchain.sapling.get_tree_state':
                 self.sapling_get_tree_state,
             'blockchain.sapling.get_treestate':
+                self.sapling_get_tree_state,
+            'sapling.get_tree_state':
                 self.sapling_get_tree_state,
             'blockchain.nullifier.get_spend':
                 self.nullifier_get_spend,
@@ -2197,13 +2215,19 @@ class PIVXSaplingElectrumX(ElectrumX):
                 self.commitment_get_info,
             'blockchain.sapling.get_commitment':
                 self.commitment_get_info,
+            'sapling.get_commitment_info':
+                self.commitment_get_info,
             'blockchain.anchor.get_height':
                 self.anchor_get_height,
             'blockchain.sapling.get_anchor_height':
                 self.anchor_get_height,
+            'sapling.get_anchor_height':
+                self.anchor_get_height,
             'blockchain.sapling.get_best_anchor':
                 self.sapling_get_best_anchor,
             'blockchain.sapling.best_anchor':
+                self.sapling_get_best_anchor,
+            'sapling.get_best_anchor':
                 self.sapling_get_best_anchor,
             'blockchain.transaction.get_sapling':
                 self.transaction_get_sapling,
