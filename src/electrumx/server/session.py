@@ -2351,7 +2351,7 @@ class PIVXSaplingElectrumX(ElectrumX):
         return {
             'success': complete and error is None,
             'complete': complete,
-            'empty': complete and not blocks,
+            'empty': complete and total_sapling_txs == 0,
             'contract': PIVX_SAPLING_RPC_CONTRACT,
             'start_height': start_height,
             'end_height': end_height,
@@ -2516,9 +2516,13 @@ class PIVXSaplingElectrumX(ElectrumX):
 
         try:
             # Get block hashes for the range using proper daemon API
-            block_hashes = await self.session_mgr.daemon.block_hex_hashes(
-                start_height, block_count
-            )
+            for attempt in range(2):
+                block_hashes = await self.session_mgr.daemon.block_hex_hashes(
+                    start_height, block_count
+                )
+                if len(block_hashes) == block_count or attempt:
+                    break
+                await sleep(0.05)
 
             block_hash_items = [
                 {
@@ -2537,7 +2541,12 @@ class PIVXSaplingElectrumX(ElectrumX):
                     actual_count=len(block_hashes))
 
             # Get raw blocks using proper daemon API
-            raw_blocks = await self.session_mgr.daemon.raw_blocks(block_hashes)
+            for attempt in range(2):
+                raw_blocks = await self.session_mgr.daemon.raw_blocks(
+                    block_hashes)
+                if len(raw_blocks) == block_count or attempt:
+                    break
+                await sleep(0.05)
             if len(raw_blocks) != block_count:
                 return self._sapling_range_error_response(
                     start_height, end_height, blocks, 'missing_block',
@@ -2646,16 +2655,15 @@ class PIVXSaplingElectrumX(ElectrumX):
                             'spends': compact_spends,
                         })
 
-                if compact_txs:
-                    blocks.append({
-                        'height': height,
-                        'hash': block_hash,
-                        'block_hash': block_hash,
-                        'time': block_time,
-                        'outputs': block_outputs,
-                        'txs': compact_txs,
-                    })
-                    total_sapling_txs += len(compact_txs)
+                blocks.append({
+                    'height': height,
+                    'hash': block_hash,
+                    'block_hash': block_hash,
+                    'time': block_time,
+                    'outputs': block_outputs,
+                    'txs': compact_txs,
+                })
+                total_sapling_txs += len(compact_txs)
 
         except DaemonError as e:
             self.logger.error(f'get_block_range daemon error: {e}')

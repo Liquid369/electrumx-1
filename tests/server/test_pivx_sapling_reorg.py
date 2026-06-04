@@ -532,12 +532,19 @@ def test_get_block_range_success_empty_scanned_range_is_complete():
     assert response['complete'] is True
     assert response['empty'] is True
     assert response['height_count'] == 1
-    assert response['block_count'] == 0
+    assert response['block_count'] == 1
     assert response['sapling_tx_count'] == 0
     assert response['block_hashes'] == [
         {'height': block['height'], 'block_hash': block['hash']}
     ]
-    assert response['blocks'] == []
+    assert response['blocks'] == [{
+        'height': block['height'],
+        'hash': block['hash'],
+        'block_hash': block['hash'],
+        'time': int.from_bytes(block['raw'][68:72], 'little'),
+        'outputs': [],
+        'txs': [],
+    }]
     assert response['error'] is None
 
 
@@ -598,6 +605,68 @@ def test_get_block_range_partial_hash_response_is_not_complete():
     assert response['error']['type'] == 'missing_block_hash'
     assert response['error']['expected_count'] == 2
     assert response['error']['actual_count'] == 1
+
+
+class TransientPartialHashDaemon(FixtureDaemon):
+
+    def __init__(self, blocks):
+        super().__init__(blocks)
+        self.hash_calls = 0
+
+    async def block_hex_hashes(self, start_height, count):
+        self.hash_calls += 1
+        if self.hash_calls == 1:
+            return []
+        return await super().block_hex_hashes(start_height, count)
+
+
+def test_get_block_range_recovers_from_transient_short_hash_range():
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db()
+    daemon = TransientPartialHashDaemon([block])
+    session = make_session(db, daemon)
+
+    response = run(session.sapling_get_block_range(
+        block['height'], block['height']))
+
+    assert response['success'] is True
+    assert response['complete'] is True
+    assert response['empty'] is True
+    assert response['block_count'] == 1
+    assert response['blocks'][0]['height'] == block['height']
+    assert response['blocks'][0]['txs'] == []
+    assert daemon.hash_calls == 2
+
+
+class TransientPartialRawBlockDaemon(FixtureDaemon):
+
+    def __init__(self, blocks):
+        super().__init__(blocks)
+        self.raw_calls = 0
+
+    async def raw_blocks(self, block_hashes):
+        self.raw_calls += 1
+        if self.raw_calls == 1:
+            return []
+        return await super().raw_blocks(block_hashes)
+
+
+def test_get_block_range_recovers_from_transient_short_raw_blocks():
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db()
+    daemon = TransientPartialRawBlockDaemon([block])
+    session = make_session(db, daemon)
+
+    response = run(session.sapling_get_block_range(
+        block['height'], block['height']))
+
+    assert response['success'] is True
+    assert response['complete'] is True
+    assert response['empty'] is True
+    assert response['block_count'] == 1
+    assert response['blocks'][0]['height'] == block['height']
+    assert response['blocks'][0]['txs'] == []
+    assert daemon.raw_calls == 2
 
 
 def test_get_block_range_index_incomplete_is_not_complete():
