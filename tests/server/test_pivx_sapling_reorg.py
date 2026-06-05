@@ -1,7 +1,9 @@
 import asyncio
 from collections import defaultdict
+from functools import lru_cache
 import json
 import logging
+import subprocess
 from pathlib import Path
 from unittest import mock
 
@@ -16,6 +18,7 @@ from electrumx.server.session import (
     PIVXSaplingElectrumX,
     PIVX_SAPLING_MAX_BLOCK_RANGE,
     PIVX_SAPLING_RPC_CONTRACT,
+    PIVX_SAPLING_WITNESS_HELPER_ENV,
 )
 
 
@@ -155,6 +158,46 @@ def parse_block_txs(block):
     deser = tx_lib.DeserializerPIVX(
         block['raw'], start=Pivx.static_header_len(block['height']))
     return [deser.read_tx() for _ in range(deser._read_varint())]
+
+
+@lru_cache
+def build_witness_helper():
+    root = Path(__file__).parents[2]
+    manifest = root / 'contrib/pivx_sapling_witness/Cargo.toml'
+    binary = root / 'contrib/pivx_sapling_witness/target/debug/pivx_sapling_witness'
+    subprocess.run(
+        ['cargo', 'build', '--manifest-path', str(manifest)],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return binary
+
+
+def canonical_cmu(value):
+    return value.to_bytes(32, 'little')
+
+
+def verify_witness_with_helper(response):
+    helper = build_witness_helper()
+    payload = {
+        'mode': 'verify',
+        'commitment': response['commitment'],
+        'position': response['position'],
+        'anchor': response['anchor'],
+        'path': response['path'],
+    }
+    proc = subprocess.run(
+        [str(helper)],
+        input=json.dumps(payload),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    verified = json.loads(proc.stdout)
+    assert verified['success'] is True
+    assert verified['root'] == response['anchor']
 
 
 def index_block_sapling(db, block):

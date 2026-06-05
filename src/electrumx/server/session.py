@@ -11,13 +11,16 @@ import asyncio
 import codecs
 import datetime
 import itertools
+import json
 import math
 import os
+import shutil
 import ssl
 import time
 from collections import defaultdict
 from functools import partial
 from ipaddress import IPv4Address, IPv6Address, IPv4Network, IPv6Network
+from pathlib import Path
 from typing import Iterable, Optional, TYPE_CHECKING, Sequence, Union, Any
 
 import attr
@@ -63,6 +66,9 @@ PIVX_SAPLING_RELEASE_FEATURES = {
     'structured_errors': True,
     'canonical_witnesses': False,
 }
+PIVX_SAPLING_WITNESS_HELPER_ENV = 'PIVX_SAPLING_WITNESS_HELPER'
+PIVX_SAPLING_WITNESS_HELPER_TIMEOUT_ENV = (
+    'PIVX_SAPLING_WITNESS_HELPER_TIMEOUT')
 
 
 def scripthash_to_hashX(scripthash):
@@ -2254,6 +2260,8 @@ class PIVXSaplingElectrumX(ElectrumX):
 
     async def sapling_capabilities(self):
         features = dict(PIVX_SAPLING_RELEASE_FEATURES)
+        witness_helper_path = self._sapling_witness_helper_path()
+        features['canonical_witnesses'] = witness_helper_path is not None
         range_response_format = {
             'type': 'envelope',
             'global_output_positions': True,
@@ -2296,15 +2304,118 @@ class PIVXSaplingElectrumX(ElectrumX):
                 'unsupported_method',
                 'server_error',
             ],
-            'witness_response': 'unavailable',
+            'witness_response': (
+                'canonical_path' if features['canonical_witnesses']
+                else 'unavailable'),
+            'witness_backend': (
+                str(witness_helper_path) if witness_helper_path else None),
+            'witness_path_length': 32,
+            'witness_path_order': 'leaf_to_root',
+            'witness_path_encoding': 'sapling_node_to_bytes_hex',
             'witness_error_types': [
-                'canonical_witness_unavailable',
+                'witness_backend_unavailable',
                 'commitment_not_found',
                 'invalid_anchor',
+                'anchor_not_found',
+                'index_incomplete',
             ],
             'methods': self.SAPLING_METHODS,
             'aliases': self.SAPLING_METHOD_ALIASES,
         }
+
+    @staticmethod
+    def _sapling_witness_helper_path():
+        configured = os.environ.get(PIVX_SAPLING_WITNESS_HELPER_ENV)
+        if configured:
+            path = Path(configured)
+            if path.is_file() and os.access(path, os.X_OK):
+                return path
+            return None
+
+        discovered = shutil.which('pivx_sapling_witness')
+        if discovered:
+            return Path(discovered)
+        return None
+
+    @staticmethod
+    def _sapling_witness_helper_timeout():
+        configured = os.environ.get(PIVX_SAPLING_WITNESS_HELPER_TIMEOUT_ENV)
+        try:
+            return max(1.0, float(configured)) if configured else 60.0
+        except ValueError:
+            return 60.0
+
+    async def _sapling_call_witness_helper(self, payload):
+        helper_path = self._sapling_witness_helper_path()
+        if helper_path is None:
+            raise RPCError(
+                BAD_REQUEST,
+                'witness_backend_unavailable: set '
+                f'{PIVX_SAPLING_WITNESS_HELPER_ENV} to the '
+                'pivx_sapling_witness helper binary')
+
+        proc = await asyncio.create_subprocess_exec(
+            str(helper_path),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        request_bytes = json.dumps(payload, separators=(',', ':')).encode()
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(request_bytes),
+                timeout=self._sapling_witness_helper_timeout(),
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise RPCError(
+                BAD_REQUEST,
+                'witness_backend_timeout: canonical Sapling witness helper '
+                'timed out')
+
+        response_text = stdout.decode(errors='replace').strip()
+        if not response_text:
+            detail = stderr.decode(errors='replace').strip()
+            raise RPCError(
+                BAD_REQUEST,
+                'witness_backend_error: empty response'
+                + (f': {detail}' if detail else ''))
+        try:
+            response = json.loads(response_text)
+        except ValueError as e:
+            raise RPCError(
+                BAD_REQUEST,
+                f'witness_backend_error: invalid JSON response: {e}')
+
+        if proc.returncode != 0 or not response.get('success'):
+            error = response.get('error') or stderr.decode(
+                errors='replace').strip() or 'helper failed'
+            if 'anchor not found' in error:
+                error_type = 'anchor_not_found'
+            elif 'canonical' in error:
+                error_type = 'index_incomplete'
+            else:
+                error_type = 'witness_backend_error'
+            raise RPCError(BAD_REQUEST, f'{error_type}: {error}')
+
+        return response
+
+    def _sapling_commitments_for_witness(self):
+        commitments = []
+        for position in range(self.db.sapling_output_count):
+            info = self.db.get_sapling_output_by_position(position)
+            if info is None:
+                raise RPCError(
+                    BAD_REQUEST,
+                    f'index_incomplete: missing Sapling output position '
+                    f'{position:,d}')
+            commitment, _tx_hash, _output_index, height, _position = info
+            commitments.append({
+                'cmu': commitment.hex(),
+                'height': height,
+            })
+        return commitments
 
     async def _sapling_pivx_core_version(self):
         try:
@@ -2687,37 +2798,87 @@ class PIVXSaplingElectrumX(ElectrumX):
             position,
             anchor_hex: str = None
     ):
-        '''Return an anchor-bound witness for a Sapling output position.
+        '''Return an anchor-bound canonical Sapling witness.
 
-        The legacy implementation built witnesses from a local double-SHA256
-        placeholder tree.  Those nodes are not canonical Sapling field
-        encodings and cannot be used by PIVX Core/librustpivx spend builders.
-        Until ElectrumX has a real Sapling note-commitment-tree backend, fail
-        explicitly instead of returning an invalid witness.
+        ``position`` may be either a global Sapling output position or a
+        32-byte note commitment/cmu hex string.  The witness path is produced
+        by the configured PIVX/librustpivx helper so each sibling is the exact
+        canonical Sapling node encoding expected by spend proving.
         '''
         self.bump_cost(5.0)  # Expensive operation
 
+        requested_commitment = None
         if isinstance(position, str) and len(position) == 64:
             assert_hex_str(position)
-            info = self.db.get_commitment_position_info(bytes.fromhex(position))
-            if info is None or info[3] is None:
+            requested_commitment = bytes.fromhex(position)
+            info = self.db.get_commitment_position_info(requested_commitment)
+            if info is None:
                 raise RPCError(BAD_REQUEST, 'commitment not found')
-            position = info[3]
+            tx_hash, output_index, note_height, position = info
+            if position is None:
+                raise RPCError(
+                    BAD_REQUEST,
+                    'index_incomplete: commitment has no global position')
         else:
             position = non_negative_integer(position)
+            output_info = self.db.get_sapling_output_by_position(position)
+            if output_info is None:
+                raise RPCError(BAD_REQUEST, 'commitment not found')
+            (requested_commitment, tx_hash, output_index, note_height,
+             _position) = output_info
 
-        anchor = None
         if anchor_hex is not None:
             assert_hex_str(anchor_hex)
             if len(anchor_hex) != 64:
                 raise RPCError(BAD_REQUEST, 'anchor must be 32 bytes (64 hex)')
-            _anchor = bytes.fromhex(anchor_hex)
+            anchor_hex = anchor_hex.lower()
 
-        raise RPCError(
-            BAD_REQUEST,
-            'canonical_witness_unavailable: PIVX Sapling witnesses require '
-            'canonical Sapling note-commitment tree nodes; this ElectrumX '
-            'build does not include a PIVX Core/librustpivx witness backend')
+        payload = {
+            'mode': 'witness',
+            'position': position,
+            'anchor': anchor_hex,
+            'current_height': self.db.db_height,
+            'commitments': self._sapling_commitments_for_witness(),
+        }
+        helper_response = await self._sapling_call_witness_helper(payload)
+        path = helper_response.get('path')
+        if (not isinstance(path, list) or len(path) != 32
+                or any(not isinstance(item, str) or len(item) != 64
+                       or not is_hex_str(item) for item in path)):
+            raise RPCError(
+                BAD_REQUEST,
+                'witness_backend_error: helper returned invalid path shape')
+
+        root = helper_response.get('root') or helper_response.get('anchor')
+        if not isinstance(root, str) or len(root) != 64 or not is_hex_str(root):
+            raise RPCError(
+                BAD_REQUEST,
+                'witness_backend_error: helper returned invalid anchor')
+        root = root.lower()
+        if anchor_hex is not None and root != anchor_hex:
+            raise RPCError(
+                BAD_REQUEST,
+                'anchor_mismatch: helper witness root does not match '
+                'requested anchor')
+
+        return {
+            'commitment': requested_commitment.hex(),
+            'cmu': requested_commitment.hex(),
+            'position': position,
+            'global_position': position,
+            'height': note_height,
+            'txid': hash_to_hex_str(tx_hash),
+            'output_index': output_index,
+            'anchor': root,
+            'root': root,
+            'anchor_height': helper_response.get('anchor_height'),
+            'tree_size': helper_response.get('tree_size'),
+            'path': path,
+            'witness': path,
+            'path_order': 'leaf_to_root',
+            'path_encoding': 'sapling_node_to_bytes_hex',
+            'path_length': 32,
+        }
 
     async def sapling_get_witnesses(self, positions, anchor_hex: str = None):
         if not isinstance(positions, list):
