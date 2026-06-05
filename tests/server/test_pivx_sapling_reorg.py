@@ -370,7 +370,7 @@ def test_sapling_capabilities_do_not_advertise_release_ready_without_witness_bac
     assert capabilities['range_response_format']['block_hashes'] is True
     assert 'unsupported_method' in capabilities['range_error_types']
     assert capabilities['witness_response'] == 'unavailable'
-    assert 'canonical_witness_unavailable' in capabilities[
+    assert 'witness_backend_unavailable' in capabilities[
         'witness_error_types']
     for method in (
             'blockchain.sapling.get_block_range',
@@ -382,6 +382,23 @@ def test_sapling_capabilities_do_not_advertise_release_ready_without_witness_bac
         assert method in capabilities['methods']
     assert 'get_block_range' in capabilities['aliases'][
         'blockchain.sapling.get_block_range']
+
+
+def test_sapling_capabilities_advertise_canonical_witness_backend(monkeypatch):
+    helper = build_witness_helper()
+    monkeypatch.setenv(PIVX_SAPLING_WITNESS_HELPER_ENV, str(helper))
+    session = make_session(make_sapling_db(), FixtureDaemon([]))
+
+    capabilities = run(session.sapling_capabilities())
+
+    assert capabilities['success'] is True
+    assert capabilities['contract'] == PIVX_SAPLING_RPC_CONTRACT
+    assert capabilities['release_contract_ready'] is True
+    assert capabilities['features']['canonical_witnesses'] is True
+    assert capabilities['witness_response'] == 'canonical_path'
+    assert capabilities['witness_backend'] == str(helper)
+    assert capabilities['witness_path_length'] == 32
+    assert capabilities['witness_path_order'] == 'leaf_to_root'
 
 
 def test_sapling_cake_wallet_aliases_are_advertised_and_registered():
@@ -824,7 +841,7 @@ def test_sapling_witness_fails_closed_without_canonical_backend():
     try:
         run(session.sapling_get_witness(2, root.hex()))
     except RPCError as e:
-        assert 'canonical_witness_unavailable' in e.message
+        assert 'witness_backend_unavailable' in e.message
     else:
         raise AssertionError('non-canonical placeholder witness was returned')
 
@@ -844,6 +861,72 @@ def test_sapling_commitment_only_witness_fails_closed_without_backend():
     try:
         run(session.sapling_get_witness(commitment.hex()))
     except RPCError as e:
-        assert 'canonical_witness_unavailable' in e.message
+        assert 'witness_backend_unavailable' in e.message
     else:
         raise AssertionError('commitment-only placeholder witness was returned')
+
+
+def test_sapling_best_anchor_and_anchor_bound_witness_use_canonical_backend(
+        monkeypatch):
+    helper = build_witness_helper()
+    monkeypatch.setenv(PIVX_SAPLING_WITNESS_HELPER_ENV, str(helper))
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db()
+    db.db_height = block['height']
+    commitments = [canonical_cmu(n) for n in range(1, 5)]
+    db.flush_sapling_data(
+        db.utxo_db,
+        [],
+        [(commitment, bytes([80 + n]) * 32, n, 400 + n)
+         for n, commitment in enumerate(commitments)],
+        [],
+    )
+    session = make_session(db, FixtureDaemon([block]))
+
+    best_anchor = run(session.sapling_get_best_anchor())
+    witness = run(session.sapling_get_witness(
+        commitments[2].hex(), best_anchor['anchor']))
+
+    assert best_anchor['available'] is True
+    assert best_anchor['anchor'] == witness['anchor']
+    assert best_anchor['root'] == witness['root']
+    assert best_anchor['anchor_height'] == block['height']
+    assert best_anchor['block_hash'] == block['hash']
+    assert best_anchor['tree_size'] == 4
+    assert witness['commitment'] == commitments[2].hex()
+    assert witness['cmu'] == commitments[2].hex()
+    assert witness['position'] == 2
+    assert witness['global_position'] == 2
+    assert witness['height'] == 402
+    assert witness['anchor_height'] == block['height']
+    assert witness['tree_size'] == 4
+    assert witness['path_length'] == 32
+    assert len(witness['path']) == 32
+    assert all(isinstance(item, str) and len(item) == 64
+               for item in witness['path'])
+    verify_witness_with_helper(witness)
+
+
+def test_sapling_commitment_only_witness_reports_usable_anchor(monkeypatch):
+    helper = build_witness_helper()
+    monkeypatch.setenv(PIVX_SAPLING_WITNESS_HELPER_ENV, str(helper))
+    db = make_sapling_db()
+    db.db_height = 500
+    commitments = [canonical_cmu(n) for n in range(1, 4)]
+    db.flush_sapling_data(
+        db.utxo_db,
+        [],
+        [(commitment, bytes([90 + n]) * 32, n, 498 + n)
+         for n, commitment in enumerate(commitments)],
+        [],
+    )
+    session = make_session(db, FixtureDaemon([]))
+
+    witness = run(session.sapling_get_witness(commitments[1].hex()))
+
+    assert witness['commitment'] == commitments[1].hex()
+    assert witness['anchor'] == witness['root']
+    assert witness['anchor_height'] == 500
+    assert witness['tree_size'] == 3
+    assert len(witness['path']) == 32
+    verify_witness_with_helper(witness)

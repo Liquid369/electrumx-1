@@ -2417,6 +2417,27 @@ class PIVXSaplingElectrumX(ElectrumX):
             })
         return commitments
 
+    async def _sapling_current_anchor_from_helper(self):
+        if self._sapling_witness_helper_path() is None:
+            return None
+        if self.db.sapling_output_count <= 0:
+            return None
+        response = await self._sapling_call_witness_helper({
+            'mode': 'root',
+            'current_height': self.db.db_height,
+            'commitments': self._sapling_commitments_for_witness(),
+        })
+        anchor = response.get('anchor') or response.get('root')
+        if not isinstance(anchor, str) or len(anchor) != 64 or not is_hex_str(anchor):
+            raise RPCError(
+                BAD_REQUEST,
+                'witness_backend_error: helper returned invalid best anchor')
+        return {
+            'anchor': anchor.lower(),
+            'anchor_height': response.get('anchor_height'),
+            'tree_size': response.get('tree_size'),
+        }
+
     async def _sapling_pivx_core_version(self):
         try:
             network_info = await self.daemon_request('getnetworkinfo')
@@ -3056,6 +3077,23 @@ class PIVXSaplingElectrumX(ElectrumX):
 
     async def sapling_get_best_anchor(self):
         self.bump_cost(1.0)
+        block_hash = await self._sapling_best_anchor_block_hash()
+        try:
+            canonical_anchor = await self._sapling_current_anchor_from_helper()
+        except RPCError as e:
+            self.logger.error(f'canonical Sapling best anchor unavailable: {e}')
+            canonical_anchor = None
+        if canonical_anchor is not None:
+            return {
+                'available': True,
+                'anchor': canonical_anchor['anchor'],
+                'root': canonical_anchor['anchor'],
+                'height': self.db.db_height,
+                'anchor_height': canonical_anchor['anchor_height'],
+                'tree_size': canonical_anchor['tree_size'],
+                'block_hash': block_hash,
+            }
+
         tree_state = self.db.get_sapling_tree_state(self.db.db_height)
         anchor_height = tree_state.get('latest_anchor_height')
         try:
@@ -3069,7 +3107,7 @@ class PIVXSaplingElectrumX(ElectrumX):
             'anchor': anchor,
             'height': self.db.db_height,
             'anchor_height': anchor_height,
-            'block_hash': await self._sapling_best_anchor_block_hash(),
+            'block_hash': block_hash,
         }
 
     async def _sapling_best_anchor_block_hash(self):

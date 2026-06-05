@@ -221,6 +221,38 @@ fn witness(req: &Request) -> Result<Response, String> {
     })
 }
 
+fn root(req: &Request) -> Result<Response, String> {
+    let commitments = req
+        .commitments
+        .as_ref()
+        .ok_or_else(|| "commitments are required".to_string())?;
+
+    let mut nodes = Vec::with_capacity(commitments.len());
+    let mut heights = Vec::with_capacity(commitments.len());
+    for (index, commitment) in commitments.iter().enumerate() {
+        nodes.push(parse_node(&commitment.cmu, &format!("commitment[{index}]"))?);
+        heights.push(commitment.height);
+    }
+
+    let (tree_size, anchor_height, root) = find_anchor(
+        &nodes,
+        &heights,
+        req.anchor.as_deref(),
+        req.current_height,
+    )?;
+
+    Ok(Response {
+        success: true,
+        error: None,
+        root: Some(node_hex(&root)),
+        anchor: Some(node_hex(&root)),
+        anchor_height: Some(anchor_height),
+        tree_size: Some(tree_size),
+        path: None,
+        position: None,
+    })
+}
+
 fn verify(req: &Request) -> Result<Response, String> {
     let commitment = parse_node(
         req.commitment
@@ -287,6 +319,7 @@ fn main() {
     let result = request.and_then(|req| {
         match req.mode.as_deref().unwrap_or("witness") {
             "witness" => witness(&req),
+            "root" => root(&req),
             "verify" => verify(&req),
             other => Err(format!("unsupported mode {other}")),
         }

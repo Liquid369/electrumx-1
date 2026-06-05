@@ -17,3 +17,5 @@
 /src/e_x.egg-info/
 /electrumx.egg-info/
 /e_x.egg-info/
+
+/contrib/pivx_sapling_witness/target
