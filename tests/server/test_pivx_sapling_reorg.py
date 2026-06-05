@@ -642,6 +642,103 @@ def test_get_block_range_invalid_range_is_structured():
     assert response['error']['type'] == 'invalid_range'
 
 
+class LaggingDaemon(FixtureDaemon):
+
+    def __init__(self, blocks, cached_height):
+        super().__init__(blocks)
+        self._cached_height = cached_height
+
+    def cached_height(self):
+        return self._cached_height
+
+
+def test_sapling_capabilities_downgrade_when_index_is_behind_tip(monkeypatch):
+    helper = build_witness_helper()
+    monkeypatch.setenv(PIVX_SAPLING_WITNESS_HELPER_ENV, str(helper))
+    db = make_sapling_db()
+    db.db_height = 100
+    session = make_session(db, LaggingDaemon([], cached_height=105))
+
+    response = run(session.sapling_capabilities())
+
+    assert response['success'] is False
+    assert response['contract'] is None
+    assert response['release_contract_ready'] is False
+    assert response['features']['canonical_witnesses'] is True
+    assert response['index_status'] == {
+        'ready': False,
+        'state': 'index_not_ready',
+        'db_height': 100,
+        'daemon_height': 105,
+        'lag': 5,
+        'sapling_output_count': 0,
+        'retryable': True,
+    }
+
+
+def test_get_block_range_fails_fast_when_index_is_behind_tip():
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db()
+    db.db_height = block['height'] - 1
+    session = make_session(
+        db,
+        LaggingDaemon([block], cached_height=block['height']),
+    )
+
+    response = run(session.sapling_get_block_range(
+        block['height'], block['height']))
+
+    assert response['success'] is False
+    assert response['complete'] is False
+    assert response['empty'] is False
+    assert response['block_count'] == 0
+    assert response['error']['type'] == 'index_not_ready'
+    assert response['error']['retryable'] is True
+    assert response['error']['db_height'] == block['height'] - 1
+    assert response['error']['daemon_height'] == block['height']
+
+
+def test_live_helper_methods_fail_fast_when_index_is_behind_tip():
+    db = make_sapling_db()
+    db.db_height = 10
+    session = make_session(db, LaggingDaemon([], cached_height=12))
+
+    commitment_info = run(session.commitment_get_info('00' * 32))
+    nullifier_status = run(session.sapling_get_nullifier_status('00' * 32))
+    best_anchor = run(session.sapling_get_best_anchor())
+
+    assert commitment_info['success'] is False
+    assert commitment_info['error']['type'] == 'index_not_ready'
+    assert nullifier_status['success'] is False
+    assert nullifier_status['error']['type'] == 'index_not_ready'
+    assert best_anchor['available'] is False
+    assert best_anchor['error']['type'] == 'index_not_ready'
+
+
+class SlowHashDaemon:
+
+    def cached_height(self):
+        return 20
+
+    async def block_hex_hashes(self, start_height, count):
+        await asyncio.sleep(0.2)
+        return ['11' * 32] * count
+
+
+def test_get_block_range_core_rpc_timeout_is_structured(monkeypatch):
+    monkeypatch.setenv('PIVX_SAPLING_RPC_TIMEOUT', '0.05')
+    db = make_sapling_db()
+    db.db_height = 20
+    session = make_session(db, SlowHashDaemon())
+
+    response = run(session.sapling_get_block_range(20, 20))
+
+    assert response['success'] is False
+    assert response['complete'] is False
+    assert response['error']['type'] == 'backend_timeout'
+    assert response['error']['retryable'] is True
+
+
 class PartialHashDaemon:
 
     async def block_hex_hashes(self, start_height, count):

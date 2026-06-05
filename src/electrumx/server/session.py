@@ -69,6 +69,8 @@ PIVX_SAPLING_RELEASE_FEATURES = {
 PIVX_SAPLING_WITNESS_HELPER_ENV = 'PIVX_SAPLING_WITNESS_HELPER'
 PIVX_SAPLING_WITNESS_HELPER_TIMEOUT_ENV = (
     'PIVX_SAPLING_WITNESS_HELPER_TIMEOUT')
+PIVX_SAPLING_RPC_TIMEOUT_ENV = 'PIVX_SAPLING_RPC_TIMEOUT'
+PIVX_SAPLING_SLOW_LOG_SECONDS_ENV = 'PIVX_SAPLING_SLOW_LOG_SECONDS'
 
 
 def scripthash_to_hashX(scripthash):
@@ -2246,6 +2248,8 @@ class PIVXSaplingElectrumX(ElectrumX):
                 and request.method not in self.request_handlers):
             self.session_mgr._method_counts[request.method] += 1
             return self.sapling_method_not_supported(request.method)
+        if isinstance(request, Request) and self._is_sapling_method(request.method):
+            return await self._handle_sapling_request_with_timing(request)
         return await super().handle_request(request)
 
     @classmethod
@@ -2262,6 +2266,7 @@ class PIVXSaplingElectrumX(ElectrumX):
         features = dict(PIVX_SAPLING_RELEASE_FEATURES)
         witness_helper_path = self._sapling_witness_helper_path()
         features['canonical_witnesses'] = witness_helper_path is not None
+        index_status = self._sapling_index_status()
         range_response_format = {
             'type': 'envelope',
             'global_output_positions': True,
@@ -2274,6 +2279,7 @@ class PIVXSaplingElectrumX(ElectrumX):
             all(method in self.SAPLING_METHODS
                 for method in PIVX_SAPLING_RELEASE_METHODS)
             and all(features.values())
+            and index_status['ready']
             and range_response_format['global_output_positions']
             and range_response_format['block_hashes']
         )
@@ -2294,9 +2300,14 @@ class PIVXSaplingElectrumX(ElectrumX):
             'range_response_format': range_response_format,
             'features': features,
             'release_contract_ready': release_contract_ready,
+            'index_status': index_status,
             'range_error_types': [
                 'invalid_range',
                 'daemon_error',
+                'backend_timeout',
+                'index_not_ready',
+                'partial_index',
+                'pruned_range',
                 'missing_block_hash',
                 'missing_block',
                 'index_incomplete',
@@ -2314,14 +2325,141 @@ class PIVXSaplingElectrumX(ElectrumX):
             'witness_path_encoding': 'sapling_node_to_bytes_hex',
             'witness_error_types': [
                 'witness_backend_unavailable',
+                'witness_backend_timeout',
                 'commitment_not_found',
                 'invalid_anchor',
                 'anchor_not_found',
                 'index_incomplete',
+                'index_not_ready',
             ],
             'methods': self.SAPLING_METHODS,
             'aliases': self.SAPLING_METHOD_ALIASES,
         }
+
+    @staticmethod
+    def _sapling_env_float(name, default, minimum=0.0):
+        configured = os.environ.get(name)
+        try:
+            return max(minimum, float(configured)) if configured else default
+        except ValueError:
+            return default
+
+    @classmethod
+    def _sapling_rpc_timeout(cls):
+        return cls._sapling_env_float(PIVX_SAPLING_RPC_TIMEOUT_ENV, 8.0, 0.01)
+
+    @classmethod
+    def _sapling_slow_log_seconds(cls):
+        return cls._sapling_env_float(PIVX_SAPLING_SLOW_LOG_SECONDS_ENV, 1.0, 0.0)
+
+    async def _handle_sapling_request_with_timing(self, request):
+        method = request.method
+        start = time.monotonic()
+        self.logger.info(
+            f'sapling request start method={method} '
+            f'db_height={self.db.db_height} '
+            f'daemon_height={self._sapling_daemon_cached_height()}')
+        try:
+            result = await asyncio.wait_for(
+                super().handle_request(request),
+                timeout=self._sapling_rpc_timeout(),
+            )
+        except asyncio.TimeoutError:
+            elapsed = time.monotonic() - start
+            self.logger.warning(
+                f'sapling request timeout method={method} '
+                f'elapsed={elapsed:.3f}s '
+                f'db_height={self.db.db_height} '
+                f'daemon_height={self._sapling_daemon_cached_height()}')
+            raise RPCError(
+                BAD_REQUEST,
+                f'backend_timeout: {method} exceeded '
+                f'{self._sapling_rpc_timeout():.1f}s')
+        except RPCError as e:
+            elapsed = time.monotonic() - start
+            self.logger.warning(
+                f'sapling request rpc_error method={method} '
+                f'elapsed={elapsed:.3f}s message={e.message}')
+            raise
+        except Exception:
+            elapsed = time.monotonic() - start
+            self.logger.exception(
+                f'sapling request error method={method} '
+                f'elapsed={elapsed:.3f}s')
+            raise
+        elapsed = time.monotonic() - start
+        if elapsed >= self._sapling_slow_log_seconds():
+            self.logger.warning(
+                f'sapling request slow method={method} elapsed={elapsed:.3f}s')
+        else:
+            self.logger.info(
+                f'sapling request done method={method} elapsed={elapsed:.3f}s')
+        return result
+
+    def _sapling_daemon_cached_height(self):
+        try:
+            return self.session_mgr.daemon.cached_height()
+        except AttributeError:
+            return None
+
+    def _sapling_index_status(self):
+        db_height = self.db.db_height
+        daemon_height = self._sapling_daemon_cached_height()
+        lag = (
+            daemon_height - db_height
+            if isinstance(daemon_height, int) and isinstance(db_height, int)
+            else None
+        )
+        if lag is not None and lag > 0:
+            state = 'index_not_ready'
+            ready = False
+        elif db_height < getattr(self.coin, 'SAPLING_START_HEIGHT', 0):
+            state = 'pre_activation'
+            ready = True
+        else:
+            state = 'ready'
+            ready = True
+        return {
+            'ready': ready,
+            'state': state,
+            'db_height': db_height,
+            'daemon_height': daemon_height,
+            'lag': lag,
+            'sapling_output_count': self.db.sapling_output_count,
+            'retryable': not ready,
+        }
+
+    def _sapling_index_not_ready_error(self, requested_height=None):
+        status = self._sapling_index_status()
+        if requested_height is not None and requested_height <= self.db.db_height:
+            return None
+        if status['ready']:
+            return None
+        return {
+            'type': 'index_not_ready',
+            'message': 'Sapling index has not caught up to daemon tip',
+            'retryable': True,
+            **status,
+        }
+
+    async def _sapling_await_backend(self, label, awaitable, timeout=None):
+        timeout = self._sapling_rpc_timeout() if timeout is None else timeout
+        start = time.monotonic()
+        try:
+            result = await asyncio.wait_for(awaitable, timeout=timeout)
+        except asyncio.TimeoutError:
+            elapsed = time.monotonic() - start
+            self.logger.warning(
+                f'sapling backend timeout label={label} '
+                f'elapsed={elapsed:.3f}s timeout={timeout:.3f}s')
+            raise RPCError(
+                BAD_REQUEST,
+                f'backend_timeout: {label} exceeded {timeout:.1f}s')
+        elapsed = time.monotonic() - start
+        if elapsed >= self._sapling_slow_log_seconds():
+            self.logger.warning(
+                f'sapling backend slow label={label} elapsed={elapsed:.3f}s')
+        return result
 
     @staticmethod
     def _sapling_witness_helper_path():
@@ -2339,11 +2477,8 @@ class PIVXSaplingElectrumX(ElectrumX):
 
     @staticmethod
     def _sapling_witness_helper_timeout():
-        configured = os.environ.get(PIVX_SAPLING_WITNESS_HELPER_TIMEOUT_ENV)
-        try:
-            return max(1.0, float(configured)) if configured else 60.0
-        except ValueError:
-            return 60.0
+        return PIVXSaplingElectrumX._sapling_env_float(
+            PIVX_SAPLING_WITNESS_HELPER_TIMEOUT_ENV, 8.0, 1.0)
 
     async def _sapling_call_witness_helper(self, payload):
         helper_path = self._sapling_witness_helper_path()
@@ -2402,6 +2537,14 @@ class PIVXSaplingElectrumX(ElectrumX):
         return response
 
     def _sapling_commitments_for_witness(self):
+        cache_key = self.db.sapling_output_count
+        cached_key = getattr(
+            self.session_mgr, '_sapling_commitments_cache_key', None)
+        cached = getattr(self.session_mgr, '_sapling_commitments_cache', None)
+        if cached_key == cache_key and cached is not None:
+            return cached
+
+        start = time.monotonic()
         commitments = []
         for position in range(self.db.sapling_output_count):
             info = self.db.get_sapling_output_by_position(position)
@@ -2415,6 +2558,13 @@ class PIVXSaplingElectrumX(ElectrumX):
                 'cmu': commitment.hex(),
                 'height': height,
             })
+        elapsed = time.monotonic() - start
+        if elapsed >= self._sapling_slow_log_seconds():
+            self.logger.warning(
+                f'sapling commitment cache rebuilt '
+                f'count={len(commitments):,d} elapsed={elapsed:.3f}s')
+        self.session_mgr._sapling_commitments_cache_key = cache_key
+        self.session_mgr._sapling_commitments_cache = commitments
         return commitments
 
     async def _sapling_current_anchor_from_helper(self):
@@ -2422,6 +2572,14 @@ class PIVXSaplingElectrumX(ElectrumX):
             return None
         if self.db.sapling_output_count <= 0:
             return None
+        cache_key = (self.db.sapling_output_count, self.db.db_height)
+        cached_key = getattr(
+            self.session_mgr, '_sapling_current_anchor_cache_key', None)
+        cached = getattr(
+            self.session_mgr, '_sapling_current_anchor_cache', None)
+        if cached_key == cache_key and cached is not None:
+            return cached
+
         response = await self._sapling_call_witness_helper({
             'mode': 'root',
             'current_height': self.db.db_height,
@@ -2432,11 +2590,14 @@ class PIVXSaplingElectrumX(ElectrumX):
             raise RPCError(
                 BAD_REQUEST,
                 'witness_backend_error: helper returned invalid best anchor')
-        return {
+        anchor_info = {
             'anchor': anchor.lower(),
             'anchor_height': response.get('anchor_height'),
             'tree_size': response.get('tree_size'),
         }
+        self.session_mgr._sapling_current_anchor_cache_key = cache_key
+        self.session_mgr._sapling_current_anchor_cache = anchor_info
+        return anchor_info
 
     async def _sapling_pivx_core_version(self):
         try:
@@ -2639,6 +2800,12 @@ class PIVXSaplingElectrumX(ElectrumX):
                 f'range too large, max {PIVX_SAPLING_MAX_BLOCK_RANGE} blocks',
                 max_block_range=PIVX_SAPLING_MAX_BLOCK_RANGE)
 
+        index_error = self._sapling_index_not_ready_error(end_height)
+        if index_error is not None:
+            return self._sapling_range_response(
+                start_height, end_height, [], False, index_error,
+                0, [])
+
         # Cost based on range size
         self.bump_cost(2.0 + block_count * 0.1)
 
@@ -2649,8 +2816,10 @@ class PIVXSaplingElectrumX(ElectrumX):
         try:
             # Get block hashes for the range using proper daemon API
             for attempt in range(2):
-                block_hashes = await self.session_mgr.daemon.block_hex_hashes(
-                    start_height, block_count
+                block_hashes = await self._sapling_await_backend(
+                    'daemon.block_hex_hashes',
+                    self.session_mgr.daemon.block_hex_hashes(
+                        start_height, block_count)
                 )
                 if len(block_hashes) == block_count or attempt:
                     break
@@ -2674,8 +2843,9 @@ class PIVXSaplingElectrumX(ElectrumX):
 
             # Get raw blocks using proper daemon API
             for attempt in range(2):
-                raw_blocks = await self.session_mgr.daemon.raw_blocks(
-                    block_hashes)
+                raw_blocks = await self._sapling_await_backend(
+                    'daemon.raw_blocks',
+                    self.session_mgr.daemon.raw_blocks(block_hashes))
                 if len(raw_blocks) == block_count or attempt:
                     break
                 await sleep(0.05)
@@ -2802,6 +2972,15 @@ class PIVXSaplingElectrumX(ElectrumX):
             return self._sapling_range_response(
                 start_height, end_height, blocks, False,
                 {'type': 'daemon_error', 'message': str(e)},
+                total_sapling_txs, block_hash_items)
+        except RPCError as e:
+            error_type = (
+                'backend_timeout' if e.message.startswith('backend_timeout:')
+                else 'server_error')
+            self.logger.error(f'get_block_range RPC error: {e}')
+            return self._sapling_range_response(
+                start_height, end_height, blocks, False,
+                {'type': error_type, 'message': e.message, 'retryable': True},
                 total_sapling_txs, block_hash_items)
         except Exception as e:
             self.logger.error(f'get_block_range error: {e}')
@@ -2979,6 +3158,15 @@ class PIVXSaplingElectrumX(ElectrumX):
         Returns tx info if spent, null if unspent.
         '''
         self.bump_cost(0.5)
+        index_error = self._sapling_index_not_ready_error()
+        if index_error is not None:
+            return {
+                'success': False,
+                'txid': None,
+                'height': None,
+                'spend_index': None,
+                'error': index_error,
+            }
 
         # Validate nullifier
         assert_hex_str(nullifier_hex)
@@ -3000,6 +3188,16 @@ class PIVXSaplingElectrumX(ElectrumX):
 
     async def sapling_get_nullifier_status(self, nullifier_hex: str):
         result = await self.nullifier_get_spend(nullifier_hex)
+        if isinstance(result, dict) and result.get('success') is False:
+            return {
+                'success': False,
+                'spent': False,
+                'tx_hash': None,
+                'txid': None,
+                'height': None,
+                'spend_index': None,
+                'error': result['error'],
+            }
         if result is None:
             return {
                 'spent': False,
@@ -3044,6 +3242,17 @@ class PIVXSaplingElectrumX(ElectrumX):
         Returns tx info and output index if found.
         '''
         self.bump_cost(0.5)
+        index_error = self._sapling_index_not_ready_error()
+        if index_error is not None:
+            return {
+                'success': False,
+                'exists': False,
+                'txid': None,
+                'output_index': None,
+                'height': None,
+                'position': None,
+                'error': index_error,
+            }
 
         # Validate commitment
         assert_hex_str(commitment_hex)
@@ -3077,6 +3286,19 @@ class PIVXSaplingElectrumX(ElectrumX):
 
     async def sapling_get_best_anchor(self):
         self.bump_cost(1.0)
+        index_error = self._sapling_index_not_ready_error()
+        if index_error is not None:
+            return {
+                'available': False,
+                'anchor': None,
+                'root': None,
+                'height': self.db.db_height,
+                'anchor_height': None,
+                'tree_size': self.db.sapling_output_count,
+                'block_hash': None,
+                'error': index_error,
+            }
+
         block_hash = await self._sapling_best_anchor_block_hash()
         try:
             canonical_anchor = await self._sapling_current_anchor_from_helper()
