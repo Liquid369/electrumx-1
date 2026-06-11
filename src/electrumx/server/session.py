@@ -69,6 +69,7 @@ PIVX_SAPLING_RELEASE_FEATURES = {
 PIVX_SAPLING_WITNESS_HELPER_ENV = 'PIVX_SAPLING_WITNESS_HELPER'
 PIVX_SAPLING_WITNESS_HELPER_TIMEOUT_ENV = (
     'PIVX_SAPLING_WITNESS_HELPER_TIMEOUT')
+PIVX_SAPLING_WITNESS_STATE_FILE_ENV = 'PIVX_SAPLING_WITNESS_STATE_FILE'
 PIVX_SAPLING_RPC_TIMEOUT_ENV = 'PIVX_SAPLING_RPC_TIMEOUT'
 PIVX_SAPLING_SLOW_LOG_SECONDS_ENV = 'PIVX_SAPLING_SLOW_LOG_SECONDS'
 
@@ -2480,6 +2481,21 @@ class PIVXSaplingElectrumX(ElectrumX):
         return PIVXSaplingElectrumX._sapling_env_float(
             PIVX_SAPLING_WITNESS_HELPER_TIMEOUT_ENV, 8.0, 1.0)
 
+    def _sapling_witness_state_file(self):
+        '''Path for the helper's incremental Merkle level cache.
+
+        The cache lets repeat witness/anchor calls answer in milliseconds
+        instead of recomputing the full Pedersen tree. Defaults into the
+        ElectrumX database directory so deployments get it automatically.
+        '''
+        configured = os.environ.get(PIVX_SAPLING_WITNESS_STATE_FILE_ENV)
+        if configured:
+            return configured
+        db_dir = getattr(getattr(self, 'env', None), 'db_dir', None)
+        if not db_dir:
+            return None
+        return os.path.join(db_dir, 'pivx_sapling_witness_state.bin')
+
     async def _sapling_call_witness_helper(self, payload):
         helper_path = self._sapling_witness_helper_path()
         if helper_path is None:
@@ -2489,11 +2505,20 @@ class PIVXSaplingElectrumX(ElectrumX):
                 f'{PIVX_SAPLING_WITNESS_HELPER_ENV} to the '
                 'pivx_sapling_witness helper binary')
 
+        helper_env = None
+        state_file = self._sapling_witness_state_file()
+        if state_file:
+            helper_env = {
+                **os.environ,
+                PIVX_SAPLING_WITNESS_STATE_FILE_ENV: state_file,
+            }
+
         proc = await asyncio.create_subprocess_exec(
             str(helper_path),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=helper_env,
         )
         request_bytes = json.dumps(payload, separators=(',', ':')).encode()
         try:

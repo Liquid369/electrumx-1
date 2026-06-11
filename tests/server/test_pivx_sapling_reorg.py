@@ -1046,6 +1046,38 @@ def test_sapling_best_anchor_is_stable_across_blocks_without_outputs(
     verify_witness_with_helper(witness)
 
 
+def test_sapling_witness_state_cache_returns_identical_results(
+        monkeypatch, tmp_path):
+    helper = build_witness_helper()
+    monkeypatch.setenv(PIVX_SAPLING_WITNESS_HELPER_ENV, str(helper))
+    state_file = tmp_path / 'witness_state.bin'
+    monkeypatch.setenv(
+        'PIVX_SAPLING_WITNESS_STATE_FILE', str(state_file))
+    db = make_sapling_db()
+    db.db_height = 600
+    commitments = [canonical_cmu(n) for n in range(1, 6)]
+    db.flush_sapling_data(
+        db.utxo_db,
+        [],
+        [(commitment, bytes([40 + n]) * 32, n, 550 + n)
+         for n, commitment in enumerate(commitments)],
+        [],
+    )
+    session = make_session(db, FixtureDaemon([]))
+
+    cold = run(session.sapling_get_witness(commitments[3].hex()))
+    assert state_file.exists()
+    warm = run(session.sapling_get_witness(commitments[3].hex()))
+    anchor_bound = run(session.sapling_get_witness(
+        commitments[3].hex(), warm['anchor']))
+
+    assert warm == cold
+    assert anchor_bound['path'] == cold['path']
+    assert anchor_bound['anchor'] == cold['anchor']
+    assert anchor_bound['anchor_height'] == cold['anchor_height'] == 554
+    verify_witness_with_helper(warm)
+
+
 def test_sapling_witness_supports_historical_anchor(monkeypatch):
     helper = build_witness_helper()
     monkeypatch.setenv(PIVX_SAPLING_WITNESS_HELPER_ENV, str(helper))
