@@ -2536,8 +2536,22 @@ class PIVXSaplingElectrumX(ElectrumX):
 
         return response
 
+    def _sapling_tree_cache_key(self):
+        '''Cache key that changes whenever the indexed Sapling tree changes.
+
+        Keyed on output count plus the last indexed commitment so caches
+        survive new blocks without Sapling activity but are invalidated by
+        reorgs that replace tree contents.
+        '''
+        count = self.db.sapling_output_count
+        if count <= 0:
+            return (0, None)
+        last = self.db.get_sapling_output_by_position(count - 1)
+        last_commitment = last[0].hex() if last is not None else None
+        return (count, last_commitment)
+
     def _sapling_commitments_for_witness(self):
-        cache_key = self.db.sapling_output_count
+        cache_key = self._sapling_tree_cache_key()
         cached_key = getattr(
             self.session_mgr, '_sapling_commitments_cache_key', None)
         cached = getattr(self.session_mgr, '_sapling_commitments_cache', None)
@@ -2572,7 +2586,11 @@ class PIVXSaplingElectrumX(ElectrumX):
             return None
         if self.db.sapling_output_count <= 0:
             return None
-        cache_key = (self.db.sapling_output_count, self.db.db_height)
+        # Keyed on tree contents, not chain height: the canonical anchor only
+        # changes when new Sapling outputs are indexed, so blocks without
+        # Sapling activity keep serving the cached anchor instead of paying a
+        # full helper root recomputation every block.
+        cache_key = self._sapling_tree_cache_key()
         cached_key = getattr(
             self.session_mgr, '_sapling_current_anchor_cache_key', None)
         cached = getattr(
@@ -3300,11 +3318,13 @@ class PIVXSaplingElectrumX(ElectrumX):
             }
 
         block_hash = await self._sapling_best_anchor_block_hash()
+        canonical_error = None
         try:
             canonical_anchor = await self._sapling_current_anchor_from_helper()
         except RPCError as e:
             self.logger.error(f'canonical Sapling best anchor unavailable: {e}')
             canonical_anchor = None
+            canonical_error = str(e)
         if canonical_anchor is not None:
             return {
                 'available': True,
@@ -3316,20 +3336,25 @@ class PIVXSaplingElectrumX(ElectrumX):
                 'block_hash': block_hash,
             }
 
-        tree_state = self.db.get_sapling_tree_state(self.db.db_height)
-        anchor_height = tree_state.get('latest_anchor_height')
-        try:
-            anchor = await self.daemon_request('getbestsaplinganchor')
-        except (AttributeError, DaemonError, RPCError):
-            anchor = tree_state.get('latest_anchor')
-        if anchor is None:
-            anchor_height = None
+        # Fail closed: legacy daemon/tree-state anchors use a different node
+        # encoding than canonical helper witness roots, so a client binding a
+        # witness to one can never validate it. Serving them silently poisons
+        # anchor-bound `get_witness` calls; return a structured unavailable
+        # response instead.
         return {
-            'available': anchor is not None,
-            'anchor': anchor,
+            'available': False,
+            'anchor': None,
+            'root': None,
             'height': self.db.db_height,
-            'anchor_height': anchor_height,
+            'anchor_height': None,
+            'tree_size': self.db.sapling_output_count,
             'block_hash': block_hash,
+            'error': {
+                'type': 'canonical_anchor_unavailable',
+                'message': canonical_error
+                           or 'canonical Sapling witness backend is not '
+                              'available on this server',
+            },
         }
 
     async def _sapling_best_anchor_block_hash(self):

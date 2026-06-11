@@ -26,6 +26,27 @@ def setup_base_env():
     os.environ.update(base_environ)
 
 
+@pytest.fixture(autouse=True, scope='module')
+def _restore_environ_after_module():
+    # These tests clear and rewrite os.environ; restore the original
+    # environment when the module finishes so later test files (e.g. ones
+    # that spawn cargo to build the Sapling witness helper) still see PATH
+    # and friends.
+    saved = os.environ.copy()
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+@pytest.fixture(autouse=True)
+def _seed_base_environ(_restore_environ_after_module):
+    # Each test starts from the documented base environment; several tests
+    # construct Env() without calling setup_base_env() themselves.
+    setup_base_env()
+
+
 def assert_required(env_var):
     setup_base_env()
     os.environ.pop(env_var, None)

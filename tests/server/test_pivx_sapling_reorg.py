@@ -493,7 +493,11 @@ def test_sapling_unknown_contract_method_returns_structured_error():
     assert 'blockchain.sapling.get_block_range' in response['supported_methods']
 
 
-def test_sapling_best_anchor_falls_back_when_daemon_method_missing():
+def test_sapling_best_anchor_fails_closed_without_canonical_backend():
+    # Legacy daemon/tree-state anchors use a different node encoding than
+    # canonical helper witness roots, so a client binding a witness to one can
+    # never validate it. Without the canonical witness backend the v1 method
+    # must return a structured unavailable response, never a legacy anchor.
     block = load_block_fixture('pivx_mainnet_2703076.json')
     db = make_sapling_db()
     db.db_height = block['height']
@@ -503,13 +507,13 @@ def test_sapling_best_anchor_falls_back_when_daemon_method_missing():
 
     response = run(session.sapling_get_best_anchor())
 
-    assert response == {
-        'available': True,
-        'anchor': anchor.hex(),
-        'height': block['height'],
-        'anchor_height': block['height'],
-        'block_hash': block['hash'],
-    }
+    assert response['available'] is False
+    assert response['anchor'] is None
+    assert response['root'] is None
+    assert response['height'] == block['height']
+    assert response['anchor_height'] is None
+    assert response['block_hash'] == block['hash']
+    assert response['error']['type'] == 'canonical_anchor_unavailable'
 
 
 def test_sapling_best_anchor_returns_structured_response_without_anchor():
@@ -520,13 +524,12 @@ def test_sapling_best_anchor_returns_structured_response_without_anchor():
 
     response = run(session.sapling_get_best_anchor())
 
-    assert response == {
-        'available': False,
-        'anchor': None,
-        'height': block['height'],
-        'anchor_height': None,
-        'block_hash': block['hash'],
-    }
+    assert response['available'] is False
+    assert response['anchor'] is None
+    assert response['anchor_height'] is None
+    assert response['height'] == block['height']
+    assert response['block_hash'] == block['hash']
+    assert response['error']['type'] == 'canonical_anchor_unavailable'
 
 
 def test_unknown_commitment_info_returns_structured_absent_response():
@@ -984,10 +987,13 @@ def test_sapling_best_anchor_and_anchor_bound_witness_use_canonical_backend(
     witness = run(session.sapling_get_witness(
         commitments[2].hex(), best_anchor['anchor']))
 
+    # The anchor height is the height of the last leaf in the selected tree,
+    # not the chain tip, so best-anchor and witness responses stay consistent
+    # across later blocks without Sapling activity.
     assert best_anchor['available'] is True
     assert best_anchor['anchor'] == witness['anchor']
     assert best_anchor['root'] == witness['root']
-    assert best_anchor['anchor_height'] == block['height']
+    assert best_anchor['anchor_height'] == 403
     assert best_anchor['block_hash'] == block['hash']
     assert best_anchor['tree_size'] == 4
     assert witness['commitment'] == commitments[2].hex()
@@ -995,12 +1001,89 @@ def test_sapling_best_anchor_and_anchor_bound_witness_use_canonical_backend(
     assert witness['position'] == 2
     assert witness['global_position'] == 2
     assert witness['height'] == 402
-    assert witness['anchor_height'] == block['height']
+    assert witness['anchor_height'] == 403
     assert witness['tree_size'] == 4
     assert witness['path_length'] == 32
     assert len(witness['path']) == 32
     assert all(isinstance(item, str) and len(item) == 64
                for item in witness['path'])
+    verify_witness_with_helper(witness)
+
+
+def test_sapling_best_anchor_is_stable_across_blocks_without_outputs(
+        monkeypatch):
+    helper = build_witness_helper()
+    monkeypatch.setenv(PIVX_SAPLING_WITNESS_HELPER_ENV, str(helper))
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db()
+    db.db_height = block['height']
+    commitments = [canonical_cmu(n) for n in range(1, 4)]
+    db.flush_sapling_data(
+        db.utxo_db,
+        [],
+        [(commitment, bytes([70 + n]) * 32, n, 300 + n)
+         for n, commitment in enumerate(commitments)],
+        [],
+    )
+    later_block = {'height': block['height'] + 5, 'hash': '22' * 32}
+    session = make_session(db, FixtureDaemon([block, later_block]))
+
+    first = run(session.sapling_get_best_anchor())
+    # New blocks without Sapling outputs must not change or recompute the
+    # canonical anchor, and a witness bound to the earlier anchor must still
+    # report the same anchor height after the tip moves.
+    db.db_height = block['height'] + 5
+    second = run(session.sapling_get_best_anchor())
+    witness = run(session.sapling_get_witness(
+        commitments[0].hex(), first['anchor']))
+
+    assert first['available'] is True
+    assert second['available'] is True
+    assert second['anchor'] == first['anchor']
+    assert second['anchor_height'] == first['anchor_height'] == 302
+    assert witness['anchor'] == first['anchor']
+    assert witness['anchor_height'] == first['anchor_height']
+    verify_witness_with_helper(witness)
+
+
+def test_sapling_witness_supports_historical_anchor(monkeypatch):
+    helper = build_witness_helper()
+    monkeypatch.setenv(PIVX_SAPLING_WITNESS_HELPER_ENV, str(helper))
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db()
+    db.db_height = block['height']
+    early = [canonical_cmu(n) for n in range(1, 4)]
+    db.flush_sapling_data(
+        db.utxo_db,
+        [],
+        [(commitment, bytes([60 + n]) * 32, n, 200 + n)
+         for n, commitment in enumerate(early)],
+        [],
+    )
+    session = make_session(db, FixtureDaemon([block]))
+    historical_anchor = run(session.sapling_get_best_anchor())
+
+    # New outputs after the anchor was selected: the witness must be computed
+    # against the historical tree state bound to the requested anchor, not the
+    # grown current tree.
+    late = [canonical_cmu(n) for n in range(10, 13)]
+    db.flush_sapling_data(
+        db.utxo_db,
+        [],
+        [(commitment, bytes([65 + n]) * 32, n, 210 + n)
+         for n, commitment in enumerate(late)],
+        [],
+    )
+
+    witness = run(session.sapling_get_witness(
+        early[1].hex(), historical_anchor['anchor']))
+    current = run(session.sapling_get_best_anchor())
+
+    assert current['anchor'] != historical_anchor['anchor']
+    assert witness['anchor'] == historical_anchor['anchor']
+    assert witness['anchor_height'] == historical_anchor['anchor_height'] == 202
+    assert witness['tree_size'] == 3
+    assert witness['position'] == 1
     verify_witness_with_helper(witness)
 
 

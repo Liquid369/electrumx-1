@@ -7,6 +7,7 @@ edition = "2021"
 bls12_381 = "0.8"
 ff = "0.13"
 hex = "0.4"
+rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zcash_primitives = { git = "https://github.com/PIVX-Project/librustzcash", rev = "e7662b23d16c38595ef9ad1f3ae683b1f54dc732", default-features = false }

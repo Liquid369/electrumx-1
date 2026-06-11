@@ -1,7 +1,11 @@
 use ff::PrimeField;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read};
+use std::sync::OnceLock;
 use zcash_primitives::sapling::{merkle_hash, Node, SAPLING_COMMITMENT_TREE_DEPTH_U8};
+
+const TREE_DEPTH: usize = SAPLING_COMMITMENT_TREE_DEPTH_U8 as usize;
 
 #[derive(Deserialize)]
 struct Commitment {
@@ -16,6 +20,10 @@ struct Request {
     commitment: Option<String>,
     position: Option<u64>,
     anchor: Option<String>,
+    // Accepted for protocol compatibility; anchor heights are derived from
+    // the last leaf of the selected tree so responses are stable across
+    // chain-tip changes that do not alter the Sapling tree.
+    #[allow(dead_code)]
     current_height: Option<u32>,
     path: Option<Vec<String>>,
 }
@@ -64,28 +72,37 @@ fn combine(level: u8, lhs: &Node, rhs: &Node) -> Node {
     node_from_bytes(repr, "computed parent").expect("Sapling parent hash is canonical")
 }
 
-fn empty_node(level: u8) -> Node {
-    let mut node = Node::from_scalar(bls12_381::Scalar::one());
-    for depth in 0..level {
-        node = combine(depth, &node, &node);
-    }
-    node
+fn empty_nodes() -> &'static [Node; TREE_DEPTH + 1] {
+    static EMPTIES: OnceLock<[Node; TREE_DEPTH + 1]> = OnceLock::new();
+    EMPTIES.get_or_init(|| {
+        let mut nodes = [Node::from_scalar(bls12_381::Scalar::one()); TREE_DEPTH + 1];
+        for level in 1..=TREE_DEPTH {
+            let child = nodes[level - 1];
+            nodes[level] = combine((level - 1) as u8, &child, &child);
+        }
+        nodes
+    })
+}
+
+fn reduce_level(level_nodes: Vec<Node>, level: usize) -> Vec<Node> {
+    let empty = empty_nodes()[level];
+    level_nodes
+        .par_chunks(2)
+        .map(|pair| {
+            let left = pair[0];
+            let right = pair.get(1).copied().unwrap_or(empty);
+            combine(level as u8, &left, &right)
+        })
+        .collect()
 }
 
 fn root_from_nodes(nodes: &[Node]) -> Node {
     if nodes.is_empty() {
-        return empty_node(SAPLING_COMMITMENT_TREE_DEPTH_U8);
+        return empty_nodes()[TREE_DEPTH];
     }
     let mut level_nodes = nodes.to_vec();
-    for level in 0..SAPLING_COMMITMENT_TREE_DEPTH_U8 {
-        let empty = empty_node(level);
-        let mut next_level = Vec::with_capacity((level_nodes.len() + 1) / 2);
-        for pair in level_nodes.chunks(2) {
-            let left = pair[0];
-            let right = pair.get(1).copied().unwrap_or(empty);
-            next_level.push(combine(level, &left, &right));
-        }
-        level_nodes = next_level;
+    for level in 0..TREE_DEPTH {
+        level_nodes = reduce_level(level_nodes, level);
     }
     level_nodes[0]
 }
@@ -97,81 +114,109 @@ fn witness_path(nodes: &[Node], position: usize) -> Result<Vec<Node>, String> {
 
     let mut level_nodes = nodes.to_vec();
     let mut index = position;
-    let mut path = Vec::with_capacity(usize::from(SAPLING_COMMITMENT_TREE_DEPTH_U8));
+    let mut path = Vec::with_capacity(TREE_DEPTH);
 
-    for level in 0..SAPLING_COMMITMENT_TREE_DEPTH_U8 {
+    for level in 0..TREE_DEPTH {
         let sibling_index = index ^ 1;
-        let empty = empty_node(level);
-        let sibling = level_nodes.get(sibling_index).copied().unwrap_or(empty);
+        let sibling = level_nodes
+            .get(sibling_index)
+            .copied()
+            .unwrap_or(empty_nodes()[level]);
         path.push(sibling);
 
-        let mut next_level = Vec::with_capacity((level_nodes.len() + 1) / 2);
-        for pair in level_nodes.chunks(2) {
-            let left = pair[0];
-            let right = pair.get(1).copied().unwrap_or(empty);
-            next_level.push(combine(level, &left, &right));
-        }
-        level_nodes = next_level;
+        level_nodes = reduce_level(level_nodes, level);
         index >>= 1;
     }
 
     Ok(path)
 }
 
+/// Append-only Sapling commitment-tree frontier.
+///
+/// Appending a leaf costs amortized O(1) Merkle hashes and a frontier root
+/// costs at most `TREE_DEPTH` hashes, so replaying every end-of-height tree
+/// state to locate a historical anchor is O(leaves + boundaries * depth)
+/// instead of recomputing a full O(leaves) root at every height boundary.
+struct Frontier {
+    parents: [Option<Node>; TREE_DEPTH],
+}
+
+impl Frontier {
+    fn new() -> Self {
+        Frontier {
+            parents: [None; TREE_DEPTH],
+        }
+    }
+
+    fn append(&mut self, leaf: Node) -> Result<(), String> {
+        let mut carried = leaf;
+        for level in 0..TREE_DEPTH {
+            match self.parents[level].take() {
+                None => {
+                    self.parents[level] = Some(carried);
+                    return Ok(());
+                }
+                Some(left) => carried = combine(level as u8, &left, &carried),
+            }
+        }
+        Err("Sapling commitment tree is full".to_string())
+    }
+
+    fn root(&self) -> Node {
+        let empties = empty_nodes();
+        let mut carried: Option<Node> = None;
+        for level in 0..TREE_DEPTH {
+            carried = match (self.parents[level], carried) {
+                (Some(left), Some(right)) => Some(combine(level as u8, &left, &right)),
+                (Some(left), None) => Some(combine(level as u8, &left, &empties[level])),
+                (None, Some(left)) => Some(combine(level as u8, &left, &empties[level])),
+                (None, None) => None,
+            };
+        }
+        carried.unwrap_or(empties[TREE_DEPTH])
+    }
+}
+
 fn find_anchor(
     nodes: &[Node],
     heights: &[u32],
     target_anchor: Option<&str>,
-    current_height: Option<u32>,
 ) -> Result<(usize, u32, Node), String> {
     if nodes.is_empty() {
         return Err("Sapling tree has no commitments".to_string());
     }
 
+    // The anchor height is always the height of the last leaf included in the
+    // selected tree, never the chain tip, so the same tree state reports the
+    // same anchor height from every call regardless of how many later
+    // non-Sapling blocks exist. Best-anchor and witness responses must agree
+    // on this value for anchor-bound witness validation to pass client-side.
     if let Some(anchor_hex) = target_anchor {
         let anchor = parse_32_hex(anchor_hex, "anchor")?;
         let current_root = root_from_nodes(nodes);
         if node_bytes(&current_root) == anchor {
-            return Ok((
-                nodes.len(),
-                current_height.unwrap_or_else(|| *heights.last().unwrap()),
-                current_root,
-            ));
+            return Ok((nodes.len(), heights[nodes.len() - 1], current_root));
         }
 
-        let mut current_nodes = Vec::new();
-        let mut matched = None;
-
+        let mut frontier = Frontier::new();
         for (index, node) in nodes.iter().enumerate() {
-            current_nodes.push(*node);
+            frontier.append(*node)?;
             let end_of_height = heights
                 .get(index + 1)
                 .map_or(true, |next_height| *next_height != heights[index]);
-            if end_of_height {
-                let root = root_from_nodes(&current_nodes);
-                if node_bytes(&root) == anchor {
-                    matched = Some((index + 1, heights[index], root));
-                }
+            if !end_of_height {
+                continue;
+            }
+            let root = frontier.root();
+            if node_bytes(&root) == anchor {
+                return Ok((index + 1, heights[index], root));
             }
         }
 
-        if let Some((tree_size, height, root)) = matched {
-            let anchor_height = if tree_size == nodes.len() {
-                current_height.unwrap_or(height)
-            } else {
-                height
-            };
-            Ok((tree_size, anchor_height, root))
-        } else {
-            Err("anchor not found in indexed canonical Sapling tree".to_string())
-        }
+        Err("anchor not found in indexed canonical Sapling tree".to_string())
     } else {
         let root = root_from_nodes(nodes);
-        Ok((
-            nodes.len(),
-            current_height.unwrap_or_else(|| *heights.last().unwrap()),
-            root,
-        ))
+        Ok((nodes.len(), heights[nodes.len() - 1], root))
     }
 }
 
@@ -196,7 +241,6 @@ fn witness(req: &Request) -> Result<Response, String> {
         &nodes,
         &heights,
         req.anchor.as_deref(),
-        req.current_height,
     )?;
     if position_usize >= tree_size {
         return Err("commitment position is after selected anchor".to_string());
@@ -238,7 +282,6 @@ fn root(req: &Request) -> Result<Response, String> {
         &nodes,
         &heights,
         req.anchor.as_deref(),
-        req.current_height,
     )?;
 
     Ok(Response {
