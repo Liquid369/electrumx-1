@@ -169,7 +169,8 @@ def create_sapling_tx_hex(
     Layout after nLockTime:
       Optional<SaplingTxData>: 1 presence byte, then when present
         valueBalance (int64) + vShieldedSpend + vShieldedOutput +
-        bindingSig(64) only if spends+outputs non-empty.
+        bindingSig(64), always present (PIVX serializes it
+        unconditionally, unlike Zcash).
       For tx_type != 0, Optional<vector<u8>> extraPayload: 1 presence
         byte + compactsize + data.
     '''
@@ -187,8 +188,8 @@ def create_sapling_tx_hex(
         parts.append("00" * 384 * num_spends)
         parts.append(format(num_outputs, '02x'))
         parts.append("00" * 948 * num_outputs)
-        if num_spends or num_outputs:
-            parts.append("00" * 64)  # bindingSig
+        # PIVX serializes bindingSig unconditionally (unlike Zcash)
+        parts.append("00" * 64)  # bindingSig
     else:
         parts.append("00")  # SaplingTxData absent
 
@@ -210,7 +211,8 @@ class TestDeserializerPIVXSapling:
     create_sapling_tx_hex = staticmethod(create_sapling_tx_hex)
 
     def test_empty_sapling_tx(self):
-        '''Present SaplingTxData with empty vectors: no bindingSig.'''
+        '''Present SaplingTxData with empty vectors still carries
+        the unconditional 64-byte bindingSig.'''
         tx_hex = create_sapling_tx_hex()
         raw = bytes.fromhex(tx_hex)
         deser = tx_lib.DeserializerPIVX(raw)
@@ -220,7 +222,6 @@ class TestDeserializerPIVXSapling:
         assert isinstance(tx, tx_lib.TxPIVX)
         assert not isinstance(tx, tx_lib.TxPIVXSapling)
         assert tx.version == 3
-        # Empty shielded vectors mean no binding signature is serialized
         assert deser.cursor == len(raw)
 
     def test_absent_sapling_data(self):
@@ -347,7 +348,7 @@ class TestDeserializerPIVXSpecialTx:
 
     def test_special_tx_with_empty_sapling_and_extra_payload(self):
         '''nVersion=3, nType=6, sapData present with empty vectors (so no
-        bindingSig), followed by an extraPayload blob.'''
+        unconditional bindingSig), followed by an extraPayload blob.'''
         payload = bytes(range(80))
         tx_hex = create_sapling_tx_hex(tx_type=6, extra_payload=payload)
         raw = bytes.fromhex(tx_hex)
@@ -410,3 +411,36 @@ class TestDeserializerPIVXSpecialTx:
         assert len(tx.sapling_outputs) == 1
         assert len(tx.binding_sig) == 64
         assert deser.cursor == len(raw)
+
+
+class TestRealTransparentV3Tx:
+    """Regression for mainnet tx 2d356c83... (block 2,981,155): a v3
+    transparent tx whose empty SaplingTxData still carries the 64-byte
+    all-zero bindingSig.  Treating bindingSig as conditional computed a
+    short txid and broke sync with 'UTXO not found in h table'."""
+
+    RAW_HEX = (
+        '03000000010d645269c674db34c89d15536d5b81fcd2ef223c57a8a882'
+        '65ff069727338cf4000000006a473044022028fe6728d6f9ad3f6e97da'
+        '7c9c5e1981d2f0a319ada6cbcdbc27f332d4fd6ffa0220063523015a6e'
+        '0577134874391ca562403720c5231682324786b0f2a8afaa438b012102'
+        '347381b756c52be48cb06245609bef2c6be21ec82ae563f3ad03f66904'
+        '43e050ffffffff0240e31c59020000001976a914151d67e095843000f6'
+        '970cd04a3222cf348a194188acb0bae400000000001976a91492dcf18f'
+        'f36591719d7ad6b741513af52975d93888ac0000000001000000000000'
+        '0000000000000000000000000000000000000000000000000000000000'
+        '0000000000000000000000000000000000000000000000000000000000'
+        '00000000000000000000'
+    )
+
+    def test_txid_and_full_consumption(self):
+        raw = bytes.fromhex(self.RAW_HEX)
+        deser = tx_lib.DeserializerPIVX(raw)
+        tx = deser.read_tx()
+        assert deser.cursor == len(raw)
+        assert tx.version == 3
+        assert tx.txtype == 0
+        assert not isinstance(tx, tx_lib.TxPIVXSapling)
+        assert tx.txid[::-1].hex() == (
+            '2d356c839e8c4d25207355ad5a3838561bc2cf6d6192a0f9e07fbe8dcb'
+            'ff4369')

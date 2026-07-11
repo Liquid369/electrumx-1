@@ -649,11 +649,10 @@ class DeserializerPIVX(Deserializer):
                 sapling_outputs = [self._read_sapling_output()
                                    for _ in range(shielded_output_count)]
 
-                # Binding signature is serialized only when there are
-                # shielded components.  v3 special txs with empty
-                # shielded vectors have none.
-                if sapling_spends or sapling_outputs:
-                    binding_sig = self._read_nbytes(64)
+                # PIVX serializes bindingSig unconditionally inside
+                # SaplingTxData (unlike Zcash): transparent v3 txs
+                # carry a 64-byte all-zero signature
+                binding_sig = self._read_nbytes(64)
 
             # Optional<vector<uint8>> extraPayload for special tx types:
             # 1-byte presence flag, then compact-size length + data
