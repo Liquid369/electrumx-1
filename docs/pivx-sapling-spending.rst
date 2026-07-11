@@ -1,16 +1,21 @@
 PIVX Sapling Spending: Technical Specification
 ==============================================
 
-**Status**: Design Document
+**Status**: Design Document (server-side witness support is now implemented;
+see `ElectrumX Server Support (Implemented)`_)
 **Author**: Technical Specification for ElectrumX + PIVX Sapling Integration
-**Date**: 2026-01-03
+**Date**: 2026-01-03 (updated 2026-07-11)
 
 Executive Summary
 -----------------
 
 This document specifies production-grade approaches for spending PIVX Sapling shielded
-funds in an ElectrumX-backed wallet, addressing the critical constraint that ElectrumX
-cannot provide witnesses (requires full Sapling tree state).
+funds in an ElectrumX-backed wallet.  ElectrumX now serves anchor-bound canonical
+Sapling witnesses directly (``blockchain.sapling.get_witness``, backed by the
+``pivx_sapling_witness`` helper and validated against consensus anchors), so a wallet
+can spend without maintaining any local tree state.  The local incremental Merkle
+tree remains the privacy-preserving alternative for wallets that do not want the
+server to learn which note positions they spend.
 
 Recommendation
 --------------
@@ -28,8 +33,11 @@ Recommendation
 **Tradeoff**: Higher initial bandwidth (sync ~2.7M blocks of commitments) and storage
 (tree state ~500MB-1GB), but one-time cost with incremental updates afterward.
 
-**Fallback**: Option 1 (full node RPC) as interim solution or for users unwilling
-to maintain local tree.
+**Fallback / interim**: the implemented ElectrumX witness API
+(``blockchain.sapling.get_witness``, see `ElectrumX Server Support
+(Implemented)`_).  It leaks which note positions are being spent to the
+server -- never keys or amounts -- and requires no local tree.  Option 1
+(full node RPC) is documented below for completeness only.
 
 System Architecture
 -------------------
@@ -67,6 +75,8 @@ Core Components
          │   - Block data     │      │  - Tx broadcast only │
          │   - Commitments    │      │  - Block data backup │
          │   - Nullifiers     │      │                      │
+         │   - Witnesses      │      │                      │
+         │   - Anchors        │      │                      │
          │   - Balance check  │      │                      │
          └────────────────────┘      └─────────────────────┘
 
@@ -79,7 +89,7 @@ Data Flow: Receiving → Spending
 
 **Spending Path** (This Spec)::
 
-    Select Notes → Get Witnesses (Local Tree) → Generate Proof → 
+    Select Notes → Get Witnesses (Server API or Local Tree) → Generate Proof →
     Build Transaction → Sign → Broadcast (ElectrumX) → Confirm
 
 Wallet Spend Flow (Step-by-Step)
@@ -94,8 +104,8 @@ Input: ``{recipient_address, amount, memo}``
 
 1. Query local note database for unspent notes::
 
-    SELECT * FROM sapling_notes 
-    WHERE spent = FALSE 
+    SELECT * FROM sapling_notes
+    WHERE spent = FALSE
     AND confirmations >= MIN_CONFIRMATIONS
     ORDER BY value DESC
 
@@ -117,14 +127,39 @@ Input: ``{recipient_address, amount, memo}``
     # Anchor must be recent (within last N blocks)
     anchor_height = max(note.height for note in selected_notes)
     current_height = await electrum.get_height()
-    
+
     if current_height - anchor_height > MAX_ANCHOR_AGE:
         raise AnchorTooOldError()
 
 Phase 2: Witness Generation
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-For each selected note:
+For each selected note, obtain a Merkle witness bound to the chosen anchor.
+Two sources are available.
+
+**Source A: Server witness (implemented)**::
+
+    witness = await electrum.request(
+        'blockchain.sapling.get_witness',
+        note.commitment_hex,   # display byte order (or global position int)
+        anchor_hex             # optional; must be a consensus anchor
+    )
+
+    # witness['path'] is exactly 32 sibling nodes, leaf to root, encoded
+    # as raw canonical sapling::Node::to_bytes() hex (NOT byte-reversed);
+    # witness['anchor']/'root' and 'cmu' are display byte order.
+    # The server validates the witness root against the consensus
+    # finalsaplingroot index and fails closed on mismatch, so a returned
+    # witness always binds to a real chain anchor.
+
+Batch with ``blockchain.sapling.get_witnesses`` (up to 100 positions per
+call).  Privacy note: the server learns which note positions are being
+spent.  Performance note: server-side witness generation feeds the full
+commitment stream to a helper subprocess per request; cost accounting
+scales with tree size (see `ElectrumX Server Support (Implemented)`_).
+
+**Source B: Local tree (privacy-preserving)** -- the remainder of this
+phase:
 
 1. Retrieve note's commitment position in tree::
 
@@ -139,7 +174,7 @@ For each selected note:
         position=position,
         anchor_height=anchor_height
     )
-    
+
     # Witness contains:
     # - Merkle path (32 hashes, ~1KB)
     # - Position in tree
@@ -177,10 +212,10 @@ For each spend (input note):
         proving_key=SAPLING_SPEND_VK,
         **spend_params
     )
-    
+
     # Proof output:
     # - cv (value commitment)
-    # - rk (randomized verification key)  
+    # - rk (randomized verification key)
     # - zkproof (spend proof, 192 bytes)
     # - spend_auth_sig (signature, generated in phase 4)
 
@@ -217,7 +252,7 @@ For recipient output and change:
         esk=random_scalar(),  # Ephemeral key randomness
         payment_address=output_note.recipient
     )
-    
+
     # Output:
     # - cv (value commitment)
     # - cmu (note commitment)
@@ -229,7 +264,7 @@ For recipient output and change:
 3. Generate change note if needed::
 
     change_value = sum(note.value for note in selected_notes) - amount - fee
-    
+
     if change_value > 0:
         change_note = generate_output_note(
             recipient=own_payment_address,
@@ -243,10 +278,10 @@ Phase 5: Transaction Construction
 1. Build Sapling transaction structure::
 
     tx = Transaction()
-    
+
     # Transparent inputs (if any, for fees)
     # Usually none for pure shielded spend
-    
+
     # Sapling spends (inputs)
     for note, proof, nullifier in zip(selected_notes, spend_proofs, nullifiers):
         tx.add_sapling_spend(
@@ -257,7 +292,7 @@ Phase 5: Transaction Construction
             zkproof=proof.zkproof,
             spend_auth_sig=None  # Generated in phase 6
         )
-    
+
     # Sapling outputs
     for output in [recipient_output, change_output]:
         tx.add_sapling_output(
@@ -268,7 +303,7 @@ Phase 5: Transaction Construction
             out_ciphertext=output.out_ciphertext,
             zkproof=output.zkproof
         )
-    
+
     # Binding signature (proves value balance)
     tx.binding_sig = None  # Generated in phase 6
 
@@ -334,13 +369,13 @@ Phase 7: Broadcast & Monitoring
             txid,
             verbose=True
         )
-        
+
         if status.get('confirmations', 0) >= MIN_CONFIRMATIONS:
             # Mark notes as spent
             for note in selected_notes:
                 db.mark_note_spent(note.id, txid)
             break
-        
+
         await asyncio.sleep(30)
 
 4. Watch for conflicts (double-spend / reorg)::
@@ -351,7 +386,7 @@ Phase 7: Broadcast & Monitoring
             'blockchain.nullifier.get_spend',
             nullifier
         )
-        
+
         if conflict.txid != our_txid:
             # Reorg or conflict detected
             handle_spend_conflict(nullifier, conflict)
@@ -384,10 +419,10 @@ in this context. The following is based on Zcash RPC patterns and PIVX wallet RP
     z_getbalance
     z_gettotalbalance
     z_listreceivedbyaddress
-    
+
     # Lower-level operations (may or may not exist)
     z_getwitness <commitment> <height>  # Unknown if exists
-    z_createrawtransaction              # Unknown if exists  
+    z_createrawtransaction              # Unknown if exists
     z_signrawtransaction                # Unknown if exists
 
 **Verification Strategy**::
@@ -408,7 +443,7 @@ If PIVX Core only exposes high-level wallet functions:
 
     # Import spending key into node wallet
     pivxd.importprivkey(spending_key)
-    
+
     # Or import viewing key for balance checking
     pivxd.importviewingkey(viewing_key)
 
@@ -424,7 +459,7 @@ If PIVX Core only exposes high-level wallet functions:
         minconf=10,
         fee=fee
     )
-    
+
     # Returns: operation_id (async) or txid
 
 3. **Monitor operation**::
@@ -433,7 +468,7 @@ If PIVX Core only exposes high-level wallet functions:
     while status['status'] != 'success':
         await asyncio.sleep(1)
         status = pivxd.z_getoperationstatus([operation_id])
-    
+
     txid = status['result']['txid']
 
 **Issues with this approach**:
@@ -454,7 +489,7 @@ If PIVX Core exposes low-level primitives:
         commitment=note.commitment.hex(),
         anchor_height=anchor_height
     )
-    
+
     # Returns: {
     #   'path': [...],
     #   'position': int,
@@ -514,13 +549,13 @@ Compromise approach:
         start_position=note.position - 1000,
         end_position=note.position + 1000
     )
-    
+
     # Wallet computes witness locally
     witness = wallet.compute_witness(note, subtree)
-    
+
     # Generate proof locally
     proof = wallet.generate_proof(note, witness)
-    
+
     # Build and broadcast
     tx = wallet.build_transaction(proofs, outputs)
     txid = electrumx.broadcast(tx)
@@ -531,7 +566,12 @@ notes or amounts.
 Recommendation for Option 1
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-**If implementing Option 1**:
+With the ElectrumX witness API implemented (see `ElectrumX Server
+Support (Implemented)`_), Option 1 is generally unnecessary: the server
+already provides consensus-validated witnesses without trusted full-node
+access or key exposure.
+
+**If implementing Option 1 anyway**:
 
 1. **Phase 1**: High-level wallet RPCs (Path A) as quick PoC, with clear
    warning to users about trust requirements
@@ -568,14 +608,14 @@ Data Structures
     struct SaplingTree {
         // Current leaves
         leaves: Vec<[u8; 32]>,           // All commitments
-        
+
         // Cached subtree roots (for efficiency)
         // Level i contains roots of full subtrees of size 2^i
         cached_roots: HashMap<(u32, u64), [u8; 32]>,
-        
+
         // Current tree size
         size: u64,
-        
+
         // Current root
         root: [u8; 32],
     }
@@ -585,13 +625,13 @@ Data Structures
     struct SaplingWitness {
         // Merkle path from leaf to root
         path: Vec<[u8; 32]>,  // 32 hashes
-        
+
         // Position of leaf in tree
         position: u64,
-        
+
         // Root hash (anchor)
         root: [u8; 32],
-        
+
         // Height this witness is valid for
         anchor_height: u32,
     }
@@ -605,20 +645,20 @@ Data Structures
         diversifier: [u8; 11],
         rcm: [u8; 32],
         memo: String,
-        
+
         // Blockchain position
         txid: [u8; 32],
         output_index: u32,
         height: u32,
-        
+
         // Tree position
         tree_position: u64,
-        
+
         // Spend status
         spent: bool,
         spent_txid: Option<[u8; 32]>,
         spent_height: Option<u32>,
-        
+
         // Witness cache
         witness: Option<SaplingWitness>,
     }
@@ -632,33 +672,35 @@ Sync Protocol: Building the Tree
 
     start_height = 2_700_500  # PIVX Sapling activation
     current_height = await electrumx.get_height()
-    batch_size = 1000
-    
+    batch_size = 100  # server-enforced maximum range
+
     tree = SaplingTree.new()
-    
+
     for height in range(start_height, current_height, batch_size):
         end = min(height + batch_size - 1, current_height)
-        
-        # Fetch compact blocks
-        blocks = await electrumx.request(
+
+        # Fetch compact blocks (envelope response)
+        response = await electrumx.request(
             'blockchain.sapling.get_block_range',
             height, end
         )
-        
-        for block in blocks:
+        if not response['success']:
+            raise RuntimeError(response['error'])
+
+        for block in response['blocks']:
             for tx in block['txs']:
                 for output in tx['outputs']:
                     # Append commitment to tree
                     commitment = bytes.fromhex(output['cmu'])
                     position = tree.append(commitment)
-                    
+
                     # Try to decrypt (check if ours)
                     note = try_decrypt(
                         commitment,
                         output['epk'],
                         output['ciphertext']
                     )
-                    
+
                     if note:
                         # Store our note with tree position
                         db.store_note(
@@ -667,7 +709,7 @@ Sync Protocol: Building the Tree
                             txid=tx['txid'],
                             tree_position=position
                         )
-        
+
         # Checkpoint every 10k blocks
         if height % 10000 == 0:
             tree.save_checkpoint(height)
@@ -678,22 +720,22 @@ Sync Protocol: Building the Tree
 
     last_height = db.get_last_synced_height()
     tree = load_tree_checkpoint(last_height)
-    
+
     # Sync new blocks
     current_height = await electrumx.get_height()
-    
+
     for height in range(last_height + 1, current_height + 1):
-        block = await electrumx.request(
+        response = await electrumx.request(
             'blockchain.sapling.get_block_range',
             height, height
         )
-        
+
         # Process block
-        for tx in block[0]['txs']:
+        for tx in response['blocks'][0]['txs']:
             for output in tx['outputs']:
                 commitment = bytes.fromhex(output['cmu'])
                 tree.append(commitment)
-                
+
                 # Check if ours and store
 
 2. **Update witnesses for existing notes**::
@@ -715,25 +757,25 @@ Witness Generation Algorithm
     def get_witness(tree, position, anchor_height):
         # Get commitment at position
         commitment = tree.leaves[position]
-        
+
         # Build Merkle path from leaf to root
         path = []
         current_position = position
-        
+
         for level in range(32):  # Tree depth
             # Determine if we're left or right child
             is_right = current_position % 2 == 1
             sibling_position = current_position - 1 if is_right else current_position + 1
-            
+
             # Get sibling hash
             if sibling_position < tree.size:
                 sibling = compute_node_hash(tree, sibling_position, level)
             else:
                 sibling = EMPTY_ROOT[level]  # Default empty node
-            
+
             path.append(sibling)
             current_position //= 2
-        
+
         # Compute root
         root = commitment
         for i, sibling in enumerate(path):
@@ -741,9 +783,9 @@ Witness Generation Algorithm
                 # We're right child
                 root = pedersen_hash(sibling, root)
             else:
-                # We're left child  
+                # We're left child
                 root = pedersen_hash(root, sibling)
-        
+
         return SaplingWitness(
             path=path,
             position=position,
@@ -757,7 +799,7 @@ Witness Generation Algorithm
     def append(tree, commitment):
         position = tree.size
         tree.leaves.append(commitment)
-        
+
         # Update cached roots
         current = commitment
         for level in range(32):
@@ -766,7 +808,7 @@ Witness Generation Algorithm
                 left = tree.cached_roots.get((level, position - (1 << level)))
                 tree.cached_roots[(level, position)] = pedersen_hash(left, current)
             current = tree.cached_roots.get((level, position // (1 << (level + 1))))
-        
+
         tree.size += 1
         tree.root = current
 
@@ -779,15 +821,15 @@ Storage Optimization: Pruning
 
     # Keep full tree only for recent N blocks (e.g., 1000)
     RECENT_BLOCKS = 1000
-    
+
     # For older blocks, keep:
     # - Commitments for owned notes
     # - Cached subtree roots at checkpoints
     # - Anchor roots every K blocks
-    
+
     def prune_tree(tree, current_height):
         prune_before = current_height - RECENT_BLOCKS
-        
+
         for height in range(activation, prune_before):
             if height % CHECKPOINT_INTERVAL != 0:
                 # Delete individual commitments
@@ -797,14 +839,14 @@ Storage Optimization: Pruning
 **Recovery**: If pruned, re-fetch from ElectrumX::
 
     def rebuild_witness_after_prune(note):
-        # Fetch commitments around note's height
-        blocks = await electrumx.request(
-            'blockchain.sapling.get_block_range',
-            note.height - 100,
-            note.height + 100
-        )
-        
-        # Rebuild local tree section
+        # Fetch commitments around note's height, in <=100-block
+        # batches (server-enforced maximum range)
+        for start in range(note.height - 100, note.height + 100, 100):
+            response = await electrumx.request(
+                'blockchain.sapling.get_block_range',
+                start, start + 99
+            )
+            # Rebuild local tree section from response['blocks']
         # Compute witness
 
 Reorg Handling
@@ -815,7 +857,7 @@ Reorg Handling
     # ElectrumX provides block hashes
     current_hash = await electrumx.request('blockchain.block.header', height)
     stored_hash = db.get_block_hash(height)
-    
+
     if current_hash != stored_hash:
         # Reorg detected
         handle_reorg(height)
@@ -826,25 +868,25 @@ Reorg Handling
         # 1. Rollback tree to checkpoint before reorg
         checkpoint_height = (reorg_height // CHECKPOINT_INTERVAL) * CHECKPOINT_INTERVAL
         tree = load_tree_checkpoint(checkpoint_height)
-        
+
         # 2. Replay blocks from checkpoint to current
         current_height = await electrumx.get_height()
         for height in range(checkpoint_height + 1, current_height + 1):
             # Re-sync block
-            blocks = await electrumx.request(
+            response = await electrumx.request(
                 'blockchain.sapling.get_block_range',
                 height, height
             )
-            for block in blocks:
+            for block in response['blocks']:
                 for tx in block['txs']:
                     for output in tx['outputs']:
                         tree.append(bytes.fromhex(output['cmu']))
-        
+
         # 3. Update witnesses for all notes
         for note in db.get_all_notes():
             note.witness = tree.get_witness(note.tree_position, current_height)
             db.update_note(note)
-        
+
         # 4. Check if any of our spends were reverted
         for pending_spend in db.get_pending_spends():
             tx_status = await electrumx.get_transaction(pending_spend.txid)
@@ -862,15 +904,15 @@ Checkpoint Format
         block_hash: [u8; 32],
         tree_size: u64,
         tree_root: [u8; 32],
-        
+
         // Cached subtree roots (for reconstruction)
         // Map: (level, left_position) -> root_hash
         cached_roots: HashMap<(u32, u64), [u8; 32]>,
-        
+
         // Compressed: only store roots at boundaries
         // Can reconstruct full tree by re-scanning from ElectrumX
     }
-    
+
     // File: checkpoints/<height>.checkpoint
     // Size: ~100KB-1MB per checkpoint depending on caching strategy
 
@@ -880,8 +922,8 @@ Performance Analysis
 **Initial Sync** (worst case: full chain from activation):
 
 - Blocks to sync: ~2.4M (from 2.7M to 5.1M current)
-- Batch size: 1000 blocks
-- Requests: ~2,400
+- Batch size: 100 blocks (server-enforced maximum)
+- Requests: ~24,000
 - Data per block: ~1KB (compact, no tx bodies)
 - Total download: ~2.4GB
 - Time estimate: ~1-2 hours on mobile, ~10-20 min on desktop
@@ -890,7 +932,7 @@ Performance Analysis
 
 **Incremental Sync** (daily, ~1440 blocks):
 
-- Requests: 2 (batches of 1000)
+- Requests: 15 (batches of 100)
 - Data: ~1.4MB
 - Time: <10 seconds
 - Witness updates: ~1 second per owned note
@@ -927,49 +969,63 @@ For resource-constrained mobile:
 
     # Sync during idle time, not blocking UI
 
-ElectrumX Changes (If Any)
----------------------------
+ElectrumX Server Support (Implemented)
+---------------------------------------
 
-**Already Implemented** (Sufficient for Option 2):
+The v1 server contract (``pivx.sapling.electrumx.v1``) implements
+everything both options need:
 
-- ``blockchain.sapling.get_block_range``: Provides commitments and nullifiers
-- ``blockchain.nullifier.get_spend``: Check nullifier status
-- ``blockchain.transaction.broadcast``: Broadcast signed transaction
+- ``blockchain.sapling.get_block_range``: commitments (with
+  index-verified global positions), spends, and per-height block hashes,
+  served only from the server's indexed chain (ranges above the indexed
+  tip fail with ``index_incomplete``; max 100 blocks per request)
+- ``blockchain.sapling.get_witness`` / ``get_witnesses``: anchor-bound
+  canonical Sapling witnesses produced by the ``pivx_sapling_witness``
+  helper (``contrib/pivx_sapling_witness``) and validated against the
+  consensus anchor index -- the ``finalsaplingroot`` values recorded from
+  block headers -- failing closed on any mismatch.  Requested anchors are
+  pre-validated as consensus anchors before the helper runs.
+- ``blockchain.sapling.get_best_anchor``: the canonical current anchor,
+  helper-computed and validated against the consensus anchor index
+  (existence and tree size)
+- ``blockchain.sapling.get_tree_state``: consensus ``finalsaplingroot``
+  and tree size at any indexed height, served entirely from the index --
+  this replaces hardcoded checkpoint lists for verifying a locally built
+  tree
+- ``blockchain.sapling.get_anchor_height``: first height at which an
+  anchor appeared (anchor validity check)
+- ``blockchain.sapling.get_nullifier_status`` / ``check_nullifiers`` /
+  ``blockchain.nullifier.get_spend``: nullifier spend status
+- ``blockchain.sapling.get_commitment_info``: commitment-to-position
+  lookup
+- ``blockchain.transaction.broadcast``: broadcast signed transaction
 
-**No Additional Changes Required** for Option 2.
+Byte order: all 32-byte uint256-like values in parameters and responses
+(``cmu``, ``nullifier``, ``anchor``, ``cv``, ``rk``, ``epk``, txids,
+block hashes) are PIVX Core RPC display byte order
+(``hex_byte_order: "display"`` in capabilities); witness ``path``
+elements are raw canonical Sapling node encodings
+(``witness_path_encoding: "sapling_node_to_bytes_hex"``).
 
-**Optional Enhancements**:
+**Known performance ceiling (server witnesses)**: each
+``get_witness``/``get_best_anchor`` helper invocation ships the server's
+full Sapling commitment stream as JSON to a per-request subprocess.
+This is mitigated by the helper's on-disk incremental Merkle level cache
+(state file), a server-side commitment stream cache rebuilt off the
+event loop and invalidated on reorgs, a server-wide concurrency
+semaphore on helper subprocesses, and per-session cost accounting that
+scales with tree size -- adequate for the current PIVX shielded pool.
+If the pool grows large, the documented upgrade path is a persistent
+helper process with an incremental append-only protocol.
 
-1. **Tree checkpoint service** (nice-to-have)::
+**Removed**: ``blockchain.sapling.get_nullifiers``.  Wallets derive
+spend information from the ``spends`` arrays in ``get_block_range``.
 
-    blockchain.sapling.get_tree_checkpoint(height)
-    
-    # Returns:
-    {
-        'height': 5000000,
-        'tree_size': 12345678,
-        'root': 'abcd...',
-        'checkpoint_data': 'compressed_checkpoint'
-    }
-    
-    # Allows fast bootstrap without re-scanning
-
-2. **Batched commitment queries** (optimization)::
-
-    blockchain.sapling.get_commitments_range(start_pos, end_pos)
-    
-    # Returns commitments by tree position, not block height
-    # Useful for reconstructing specific tree section
-
-3. **Anchor validity check** (safety)::
-
-    blockchain.sapling.is_anchor_valid(anchor_hex)
-    
-    # Returns: {'valid': bool, 'height': int}
-    # Validates anchor exists in chain
-
-**Implementation Priority**: Not critical for initial release. Wallet can
-work entirely with existing ``get_block_range`` API.
+**Remaining optional enhancement**: batched commitment queries by tree
+position (``get_commitments_range(start_pos, end_pos)``) would help
+Option 2 wallets reconstruct specific tree sections without re-scanning
+by height.  Not critical: the wallet can work entirely with the
+existing ``get_block_range`` API.
 
 Data Storage & Reorg Handling
 ------------------------------
@@ -981,43 +1037,43 @@ Database Schema
 
     CREATE TABLE sapling_notes (
         id INTEGER PRIMARY KEY,
-        
+
         -- Note identification
         commitment BLOB(32) NOT NULL UNIQUE,
         nullifier BLOB(32) NOT NULL UNIQUE,
-        
+
         -- Note data (from decryption)
         value INTEGER NOT NULL,
         diversifier BLOB(11) NOT NULL,
         rcm BLOB(32) NOT NULL,  -- Randomness
         memo TEXT,
-        
+
         -- Blockchain position
         txid BLOB(32) NOT NULL,
         output_index INTEGER NOT NULL,
         height INTEGER NOT NULL,
         block_hash BLOB(32) NOT NULL,
-        
+
         -- Tree position
         tree_position INTEGER NOT NULL,
-        
+
         -- Spend status
         spent BOOLEAN DEFAULT FALSE,
         spent_txid BLOB(32),
         spent_height INTEGER,
         nullifier_height INTEGER,  -- When nullifier appeared
-        
+
         -- Cached witness (optional, can regenerate)
         witness_data BLOB,  -- Serialized witness
         witness_height INTEGER,  -- Height witness is valid for
-        
+
         -- Timestamps
         received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         spent_at TIMESTAMP,
-        
+
         UNIQUE(txid, output_index)
     );
-    
+
     CREATE INDEX idx_notes_spent ON sapling_notes(spent);
     CREATE INDEX idx_notes_height ON sapling_notes(height);
     CREATE INDEX idx_notes_nullifier ON sapling_notes(nullifier);
@@ -1030,10 +1086,10 @@ Database Schema
         block_hash BLOB(32) NOT NULL,
         tree_size INTEGER NOT NULL,
         tree_root BLOB(32) NOT NULL,
-        
+
         -- Serialized tree checkpoint
         checkpoint_data BLOB,
-        
+
         synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -1064,10 +1120,10 @@ Reorg Safety Protocol
         for height in range(current_height - 100, current_height):
             stored_hash = db.get_block_hash(height)
             chain_hash = await electrumx.get_block_hash(height)
-            
+
             if stored_hash != chain_hash:
                 return height  # Reorg point
-        
+
         return None
 
 **Reorg Recovery**::
@@ -1075,29 +1131,29 @@ Reorg Safety Protocol
     async def recover_from_reorg(reorg_height):
         # 1. Rollback database state
         db.execute('BEGIN TRANSACTION')
-        
+
         # Unspend notes spent after reorg point
         db.execute('''
-            UPDATE sapling_notes 
+            UPDATE sapling_notes
             SET spent = FALSE, spent_txid = NULL, spent_height = NULL
             WHERE spent_height > ?
         ''', (reorg_height,))
-        
+
         # Delete tree state after reorg
         db.execute('DELETE FROM sapling_tree_state WHERE height > ?', (reorg_height,))
-        
+
         # Delete notes received after reorg (they may not exist anymore)
         db.execute('DELETE FROM sapling_notes WHERE height > ?', (reorg_height,))
-        
+
         db.execute('COMMIT')
-        
+
         # 2. Rebuild tree from checkpoint
         checkpoint_height = (reorg_height // 10000) * 10000
         tree = load_checkpoint(checkpoint_height)
-        
+
         # 3. Re-sync from checkpoint to current
         await sync_tree_incremental(tree, checkpoint_height + 1)
-        
+
         # 4. Re-check all pending spends
         for pending_spend in db.get_pending_spends():
             status = await electrumx.get_transaction(pending_spend.txid)
@@ -1117,19 +1173,19 @@ anchor becomes invalid.
     def select_anchor_height(notes):
         # Use anchor from oldest note, minus safety margin
         oldest_note_height = min(note.height for note in notes)
-        
+
         # Anchor must be old enough to survive reorgs
         anchor_height = oldest_note_height - ANCHOR_SAFETY_MARGIN
-        
+
         # But not too old (nodes may reject)
         current_height = get_current_height()
         max_age = 100  # Consensus rule
-        
+
         if current_height - anchor_height > max_age:
             raise AnchorTooOldError("Notes too old, anchor invalid")
-        
+
         return anchor_height
-    
+
     ANCHOR_SAFETY_MARGIN = 10  # Use anchor 10 blocks old
 
 **Verification before spend**::
@@ -1137,9 +1193,16 @@ anchor becomes invalid.
     def verify_anchor_valid(anchor, anchor_height):
         # Get current root at that height
         current_root = get_tree_root_at_height(anchor_height)
-        
+
         if current_root != anchor:
             raise AnchorInvalidError("Anchor changed due to reorg")
+
+    # Server-side check: returns the first height the anchor appeared
+    # at, or null if it is not a consensus anchor of the indexed chain
+    height = await electrumx.request(
+        'blockchain.sapling.get_anchor_height', anchor_hex)
+    if height is None:
+        raise AnchorInvalidError("Anchor not on indexed chain")
 
 Security & Privacy Analysis
 ---------------------------
@@ -1189,18 +1252,28 @@ Option 2 (Local Tree) Security Issues
 
     commitments_a = await server_a.get_block_range(height, height)
     commitments_b = await server_b.get_block_range(height, height)
-    
+
     if commitments_a != commitments_b:
         raise SecurityError("Servers disagree on commitments")
 
-2. **Checkpoint validation**: Validate tree roots against known checkpoints::
+2. **Checkpoint validation**: Validate tree state against consensus roots::
 
-    # Use checkpoints from PIVX community or code
+    # ElectrumX serves the consensus finalsaplingroot (from block
+    # headers) and tree size at any indexed height:
+    state = await electrumx.request(
+        'blockchain.sapling.get_tree_state', 5000000)
+    if not state['success']:
+        raise SecurityError(state['error'])
+    if tree.size_at_height(5000000) != state['tree_size']:
+        raise SecurityError("Tree size mismatch")
+
+    # Hardcoded community checkpoints remain useful as an independent
+    # cross-check against a malicious server:
     TRUSTED_CHECKPOINTS = {
         5000000: 'abcd1234...',  # Tree root at height 5M
         5100000: 'ef567890...',
     }
-    
+
     computed_root = tree.get_root_at_height(5000000)
     if computed_root != TRUSTED_CHECKPOINTS[5000000]:
         raise SecurityError("Tree root mismatch")
@@ -1210,7 +1283,7 @@ Option 2 (Local Tree) Security Issues
     # Every N syncs, validate tree root against full node
     node_root = await full_node.get_tree_root(height)
     local_root = tree.root
-    
+
     if node_root != local_root:
         raise SecurityError("Tree diverged from full node")
 
@@ -1243,8 +1316,12 @@ Phased Implementation Plan
 Phase 0: Prerequisites (Already Complete)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-- [x] ElectrumX ``get_block_range`` API
-- [x] Commitment and nullifier indexing
+- [x] ElectrumX ``get_block_range`` API (envelope responses, global
+  output positions, per-height block hashes)
+- [x] Commitment, nullifier, position, and consensus anchor indexing
+- [x] Server-side canonical witnesses (``get_witness`` +
+  ``pivx_sapling_witness`` helper, consensus-anchor validated)
+- [x] Consensus tree state (``get_tree_state``)
 - [x] Note trial decryption
 - [x] Balance calculation
 
@@ -1367,7 +1444,7 @@ Phase 5: User Experience & Polish (2 weeks)
 **Week 2: Documentation & Testing**
 
 - Write user documentation
-- Write developer documentation  
+- Write developer documentation
 - Conduct security audit
 - Beta testing program
 
@@ -1513,7 +1590,7 @@ Mainnet Deployment Criteria
 **Required Before Mainnet Launch**:
 
 1. All unit tests passing
-2. All integration tests passing  
+2. All integration tests passing
 3. At least 3 successful testnet end-to-end spends
 4. Security audit complete (external if possible)
 5. Performance benchmarks meet targets
@@ -1543,7 +1620,7 @@ Recommended Reading
 **Implementation References**:
 
 - librustzcash: https://github.com/zcash/librustzcash
-- Zcash lightwalletd: https://github.com/zcash/lightwalletd  
+- Zcash lightwalletd: https://github.com/zcash/lightwalletd
 - Zcash wallet SDK: https://github.com/zcash/ZcashLightClientKit
 
 **PIVX Specific**:

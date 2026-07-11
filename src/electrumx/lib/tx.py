@@ -629,45 +629,54 @@ class DeserializerPIVX(Deserializer):
         outputs = self._read_outputs()
         locktime = self._read_le_uint32()
 
+        value_balance = 0
+        sapling_spends = []
+        sapling_outputs = []
+        binding_sig = b''
+
         if version >= 3:  # >= sapling
-            self._read_varint()  # nExpiryHeight (unused)
-            value_balance = self._read_le_int64()
+            # Optional<SaplingTxData>: 1-byte presence flag, then the
+            # payload if non-zero.  PIVX Core always writes the flag for
+            # Sapling-version txs.  (There is no nExpiryHeight in PIVX.)
+            if self._read_byte():
+                value_balance = self._read_le_int64()
 
-            # Read Sapling spends
-            shielded_spend_count = self._read_varint()
-            sapling_spends = [self._read_sapling_spend()
-                              for _ in range(shielded_spend_count)]
+                shielded_spend_count = self._read_varint()
+                sapling_spends = [self._read_sapling_spend()
+                                  for _ in range(shielded_spend_count)]
 
-            # Read Sapling outputs
-            shielded_output_count = self._read_varint()
-            sapling_outputs = [self._read_sapling_output()
-                               for _ in range(shielded_output_count)]
+                shielded_output_count = self._read_varint()
+                sapling_outputs = [self._read_sapling_output()
+                                   for _ in range(shielded_output_count)]
 
-            # Read binding signature (always present for v3+)
-            binding_sig = self._read_nbytes(64)
+                # Binding signature is serialized only when there are
+                # shielded components.  v3 special txs with empty
+                # shielded vectors have none.
+                if sapling_spends or sapling_outputs:
+                    binding_sig = self._read_nbytes(64)
 
-            if tx_type > 0:
-                self.cursor += 2  # extraPayload
-
-            txid = self.TX_HASH_FN(self.binary[orig_start:self.cursor])
-
-            # Return TxPIVXSapling if there's shielded data, otherwise TxPIVX
-            if sapling_spends or sapling_outputs:
-                return TxPIVXSapling(
-                    version=version,
-                    txtype=tx_type,
-                    inputs=inputs,
-                    outputs=outputs,
-                    locktime=locktime,
-                    txid=txid,
-                    wtxid=txid,
-                    value_balance=value_balance,
-                    sapling_spends=sapling_spends,
-                    sapling_outputs=sapling_outputs,
-                    binding_sig=binding_sig,
-                )
+            # Optional<vector<uint8>> extraPayload for special tx types:
+            # 1-byte presence flag, then compact-size length + data
+            if tx_type > 0 and self._read_byte():
+                self._read_varbytes()
 
         txid = self.TX_HASH_FN(self.binary[orig_start:self.cursor])
+
+        # Return TxPIVXSapling if there's shielded data, otherwise TxPIVX
+        if sapling_spends or sapling_outputs:
+            return TxPIVXSapling(
+                version=version,
+                txtype=tx_type,
+                inputs=inputs,
+                outputs=outputs,
+                locktime=locktime,
+                txid=txid,
+                wtxid=txid,
+                value_balance=value_balance,
+                sapling_spends=sapling_spends,
+                sapling_outputs=sapling_outputs,
+                binding_sig=binding_sig,
+            )
         return TxPIVX(
             version=version,
             txtype=tx_type,

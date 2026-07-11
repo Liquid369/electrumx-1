@@ -11,109 +11,95 @@ import os
 
 from electrumx.lib import tx as tx_lib
 from electrumx.lib import coins
+from electrumx.lib.hash import hash_to_hex_str
+
+
+def load_block(filename):
+    '''Load a block from the tests/blocks directory.'''
+    base_path = os.path.dirname(os.path.dirname(__file__))
+    block_path = os.path.join(base_path, 'blocks', filename)
+    with open(block_path, 'r') as f:
+        return json.load(f)
+
+
+def read_block(block_data):
+    '''Parse a raw block with read_tx_block, returning (raw, deser, txs).'''
+    raw = bytes.fromhex(block_data['block'])
+    header_len = coins.Pivx.static_header_len(block_data['height'])
+    deser = tx_lib.DeserializerPIVX(raw, start=header_len)
+    txs = deser.read_tx_block()
+    return raw, deser, txs
+
+
+def assert_txids_match_fixture(txs, block_data):
+    assert [hash_to_hex_str(tx.txid) for tx in txs] == block_data['tx']
+
+
+def assert_only_block_signature_remains(raw, deser):
+    '''After read_tx_block the cursor must sit exactly at the trailing
+    block signature: a single varbytes blob (PoS vchBlockSig).'''
+    remaining = raw[deser.cursor:]
+    assert remaining, 'expected a trailing block signature'
+    sig_len = remaining[0]
+    assert sig_len < 253  # single-byte compactsize for real signatures
+    assert 1 + sig_len == len(remaining)
 
 
 class TestPIVXSaplingRealBlocks:
     '''Test PIVX Sapling deserialization with real mainnet blocks.'''
 
-    @staticmethod
-    def load_block(filename):
-        '''Load a block from the tests/blocks directory.'''
-        base_path = os.path.dirname(os.path.dirname(__file__))
-        block_path = os.path.join(base_path, 'blocks', filename)
-        with open(block_path, 'r') as f:
-            return json.load(f)
-
     def test_block_2703076_shielding_tx(self):
         '''Test block 2703076 which contains a shielding transaction.
 
         This block is post-Sapling activation (2,700,500) and contains
-        transactions that shield transparent funds.
+        a transaction that shields transparent funds.
         '''
-        block_data = self.load_block('pivx_mainnet_2703076.json')
+        block_data = load_block('pivx_mainnet_2703076.json')
 
         # Verify block height is post-Sapling
         assert block_data['height'] == 2703076
         assert block_data['height'] > coins.Pivx.SAPLING_START_HEIGHT
 
-        # Parse the raw block
-        raw_block = bytes.fromhex(block_data['block'])
-
         # The block header for post-Sapling PIVX is 112 bytes
-        header_len = coins.Pivx.static_header_len(block_data['height'])
-        assert header_len == 112
+        assert coins.Pivx.static_header_len(block_data['height']) == 112
 
-        # Skip header and parse transactions
-        deser = tx_lib.DeserializerPIVX(raw_block, start=header_len)
-        tx_count = deser._read_varint()
+        raw, deser, txs = read_block(block_data)
+        assert len(txs) == len(block_data['tx'])
+        assert_txids_match_fixture(txs, block_data)
+        assert_only_block_signature_remains(raw, deser)
 
-        assert tx_count == len(block_data['tx'])
+        # The shielding tx: one Sapling output, no spends
+        sapling_txs = [tx for tx in txs
+                       if isinstance(tx, tx_lib.TxPIVXSapling)]
+        assert len(sapling_txs) == 1
+        shielding_tx = sapling_txs[0]
+        assert len(shielding_tx.sapling_spends) == 0
+        assert len(shielding_tx.sapling_outputs) == 1
+        assert len(shielding_tx.binding_sig) == 64
 
-        txs = []
-        for _ in range(tx_count):
-            tx = deser.read_tx()
-            txs.append(tx)
-
-        # Verify we got all transactions
-        assert len(txs) == tx_count
-
-        # Check that at least one is a Sapling transaction
-        sapling_txs = [tx for tx in txs if isinstance(tx, tx_lib.TxPIVXSapling)]
-
-        # Block 2703076 should have Sapling transactions
-        # (shielding transaction: transparent -> shielded)
-        if sapling_txs:
-            # Verify Sapling transaction structure
-            for tx in sapling_txs:
-                assert hasattr(tx, 'value_balance')
-                assert hasattr(tx, 'sapling_spends')
-                assert hasattr(tx, 'sapling_outputs')
-                assert hasattr(tx, 'binding_sig')
-
-                # Verify binding signature is 64 bytes
-                assert len(tx.binding_sig) == 64
-
-                # If there are spends, verify structure
-                for spend in tx.sapling_spends:
-                    assert len(spend.cv) == 32
-                    assert len(spend.anchor) == 32
-                    assert len(spend.nullifier) == 32
-                    assert len(spend.rk) == 32
-                    assert len(spend.zkproof) == 192
-                    assert len(spend.spend_auth_sig) == 64
-
-                # If there are outputs, verify structure
-                for output in tx.sapling_outputs:
-                    assert len(output.cv) == 32
-                    assert len(output.cmu) == 32
-                    assert len(output.ephemeral_key) == 32
-                    assert len(output.enc_ciphertext) == 580
-                    assert len(output.out_ciphertext) == 80
-                    assert len(output.zkproof) == 192
+        for output in shielding_tx.sapling_outputs:
+            assert len(output.cv) == 32
+            assert len(output.cmu) == 32
+            assert len(output.ephemeral_key) == 32
+            assert len(output.enc_ciphertext) == 580
+            assert len(output.out_ciphertext) == 80
+            assert len(output.zkproof) == 192
 
     def test_pre_sapling_block_10000(self):
         '''Test pre-Sapling block parsing still works.'''
-        block_data = self.load_block('pivx_mainnet_10000.json')
+        block_data = load_block('pivx_mainnet_10000.json')
 
         # Verify block height is pre-Sapling
         assert block_data['height'] == 10000
         assert block_data['height'] < coins.Pivx.SAPLING_START_HEIGHT
 
-        # Parse the raw block
-        raw_block = bytes.fromhex(block_data['block'])
-
         # Pre-Sapling header is 80 bytes
-        header_len = coins.Pivx.static_header_len(block_data['height'])
-        assert header_len == 80
+        assert coins.Pivx.static_header_len(block_data['height']) == 80
 
-        # Skip header and parse transactions
-        deser = tx_lib.DeserializerPIVX(raw_block, start=header_len)
-        tx_count = deser._read_varint()
-
-        txs = []
-        for _ in range(tx_count):
-            tx = deser.read_tx()
-            txs.append(tx)
+        raw, deser, txs = read_block(block_data)
+        assert_txids_match_fixture(txs, block_data)
+        # PoW block: no trailing block signature, full consumption
+        assert deser.cursor == len(raw)
 
         # Verify transactions are TxPIVX but not TxPIVXSapling
         for tx in txs:
@@ -122,28 +108,21 @@ class TestPIVXSaplingRealBlocks:
 
     def test_zerocoin_era_block_1000000(self):
         '''Test block during Zerocoin era (has expanded header).'''
-        block_data = self.load_block('pivx_mainnet_1000000.json')
+        block_data = load_block('pivx_mainnet_1000000.json')
 
         height = block_data['height']
         assert height == 1000000
 
         # During Zerocoin era, header is 112 bytes
-        header_len = coins.Pivx.static_header_len(height)
-        assert header_len == 112
+        assert coins.Pivx.static_header_len(height) == 112
 
-        raw_block = bytes.fromhex(block_data['block'])
-        deser = tx_lib.DeserializerPIVX(raw_block, start=header_len)
-        tx_count = deser._read_varint()
+        raw, deser, txs = read_block(block_data)
+        assert_txids_match_fixture(txs, block_data)
+        assert_only_block_signature_remains(raw, deser)
 
-        txs = []
-        for _ in range(tx_count):
-            tx = deser.read_tx()
-            txs.append(tx)
-
-        # Verify transactions parsed correctly
-        assert len(txs) == tx_count
         for tx in txs:
             assert isinstance(tx, tx_lib.TxPIVX)
+            assert not isinstance(tx, tx_lib.TxPIVXSapling)
 
     def test_block_5057529_unshielding_tx(self):
         '''Test block 5057529 which contains an unshielding transaction.
@@ -151,24 +130,17 @@ class TestPIVXSaplingRealBlocks:
         This block has a Sapling tx with 2 spends and 2 outputs,
         unshielding funds from the shielded pool to transparent.
         '''
-        block_data = self.load_block('pivx_mainnet_5057529.json')
+        block_data = load_block('pivx_mainnet_5057529.json')
 
         # Verify block height
         assert block_data['height'] == 5057529
         assert block_data['height'] > coins.Pivx.SAPLING_START_HEIGHT
+        assert coins.Pivx.static_header_len(block_data['height']) == 112
 
-        raw_block = bytes.fromhex(block_data['block'])
-        header_len = coins.Pivx.static_header_len(block_data['height'])
-        assert header_len == 112
-
-        deser = tx_lib.DeserializerPIVX(raw_block, start=header_len)
-        tx_count = deser._read_varint()
-        assert tx_count == 3
-
-        txs = []
-        for _ in range(tx_count):
-            tx = deser.read_tx()
-            txs.append(tx)
+        raw, deser, txs = read_block(block_data)
+        assert len(txs) == 3
+        assert_txids_match_fixture(txs, block_data)
+        assert_only_block_signature_remains(raw, deser)
 
         # Third transaction should be TxPIVXSapling with spends
         tx3 = txs[2]
@@ -196,6 +168,14 @@ class TestPIVXSaplingRealBlocks:
         # Verify commitments are unique
         commitments = [o.cmu for o in tx3.sapling_outputs]
         assert len(set(commitments)) == 2
+
+        for spend in tx3.sapling_spends:
+            assert len(spend.cv) == 32
+            assert len(spend.anchor) == 32
+            assert len(spend.nullifier) == 32
+            assert len(spend.rk) == 32
+            assert len(spend.zkproof) == 192
+            assert len(spend.spend_auth_sig) == 64
 
 
 class TestPIVXCoinConfiguration:
@@ -244,68 +224,56 @@ class TestSaplingDataExtraction:
 
     def test_nullifier_uniqueness(self):
         '''Test that each spend has a unique nullifier.'''
-        block_data = TestPIVXSaplingRealBlocks.load_block(
-            'pivx_mainnet_2703076.json'
-        )
-
-        raw_block = bytes.fromhex(block_data['block'])
-        header_len = coins.Pivx.static_header_len(block_data['height'])
-
-        deser = tx_lib.DeserializerPIVX(raw_block, start=header_len)
-        tx_count = deser._read_varint()
+        block_data = load_block('pivx_mainnet_5057529.json')
+        _raw, _deser, txs = read_block(block_data)
 
         all_nullifiers = []
-        for _ in range(tx_count):
-            tx = deser.read_tx()
+        for tx in txs:
             if isinstance(tx, tx_lib.TxPIVXSapling):
                 for spend in tx.sapling_spends:
                     all_nullifiers.append(spend.nullifier)
 
+        assert all_nullifiers
         # Nullifiers should be unique (no double-spends in valid block)
         assert len(all_nullifiers) == len(set(all_nullifiers))
 
     def test_commitment_extraction(self):
         '''Test that commitments can be extracted for indexing.'''
-        block_data = TestPIVXSaplingRealBlocks.load_block(
-            'pivx_mainnet_2703076.json'
-        )
-
-        raw_block = bytes.fromhex(block_data['block'])
-        header_len = coins.Pivx.static_header_len(block_data['height'])
-
-        deser = tx_lib.DeserializerPIVX(raw_block, start=header_len)
-        tx_count = deser._read_varint()
+        block_data = load_block('pivx_mainnet_2703076.json')
+        _raw, _deser, txs = read_block(block_data)
 
         commitments = []
-        for _ in range(tx_count):
-            tx = deser.read_tx()
+        for tx in txs:
             if isinstance(tx, tx_lib.TxPIVXSapling):
                 for output in tx.sapling_outputs:
                     commitments.append(output.cmu)
 
+        assert commitments
         # All commitments should be 32 bytes
         for cmu in commitments:
             assert len(cmu) == 32
 
     def test_anchor_extraction(self):
         '''Test that anchors can be extracted from spends.'''
-        block_data = TestPIVXSaplingRealBlocks.load_block(
-            'pivx_mainnet_2703076.json'
-        )
-
-        raw_block = bytes.fromhex(block_data['block'])
-        header_len = coins.Pivx.static_header_len(block_data['height'])
-
-        deser = tx_lib.DeserializerPIVX(raw_block, start=header_len)
-        tx_count = deser._read_varint()
+        block_data = load_block('pivx_mainnet_5057529.json')
+        _raw, _deser, txs = read_block(block_data)
 
         anchors = []
-        for _ in range(tx_count):
-            tx = deser.read_tx()
+        for tx in txs:
             if isinstance(tx, tx_lib.TxPIVXSapling):
                 for spend in tx.sapling_spends:
                     anchors.append(spend.anchor)
 
+        assert anchors
         # All anchors should be 32 bytes (Merkle tree roots)
         for anchor in anchors:
             assert len(anchor) == 32
+
+    def test_header_final_sapling_root_is_indexable(self):
+        '''Post-Sapling expanded headers carry finalsaplingroot at bytes
+        80:112 (raw little-endian), the consensus anchor source.'''
+        block_data = load_block('pivx_mainnet_2703076.json')
+        raw = bytes.fromhex(block_data['block'])
+        root = raw[80:112]
+        assert len(root) == 32
+        assert root != bytes(32)

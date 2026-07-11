@@ -880,35 +880,76 @@ class LTORBlockProcessor(BlockProcessor):
 class PIVXSaplingBlockProcessor(BlockProcessor):
     '''Block processor for PIVX with Sapling shielded transaction support.
 
-    Indexes nullifiers, commitments, and anchors for light wallet queries.
+    Indexes nullifiers, commitments with canonical global positions, and
+    consensus anchors (finalsaplingroot from block headers) for light
+    wallet queries.
     '''
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Sapling data caches for flushing
-        self.sapling_nullifiers = []  # (nullifier, tx_hash, height)
-        self.sapling_commitments = []  # (commitment, tx_hash, idx, height)
-        self.sapling_anchors = []  # (anchor, height)
+        # Sapling data caches, flushed atomically with the UTXOs
+        self.sapling_nullifiers = []  # (nullifier, tx_hash, height, idx)
+        self.sapling_commitments = []  # (cmu, tx_hash, idx, height, pos)
+        self.sapling_anchors = []  # (root, first_height, tree_size)
         # For backup/reorg
         self.sapling_undo_nullifiers = []
         self.sapling_undo_commitments = []
-        self.sapling_undo_anchors = []
+        self._sapling_backup_pending = False
+        # In-memory global output count; the persisted value only
+        # advances at UTXO flushes.  Initialized lazily because the DB
+        # state is read after construction.
+        self.sapling_output_count = None
+        # Most recent header root, so only first appearances are
+        # recorded as anchors
+        self._last_sapling_root = None
+
+    def _sapling_count(self) -> int:
+        if self.sapling_output_count is None:
+            self.sapling_output_count = self.db.sapling_output_count
+        return self.sapling_output_count
 
     def flush_data(self):
         '''Override to include Sapling data in flush.'''
         flush_data = super().flush_data()
-        # Add Sapling data to flush.  These must be the live lists, not copies:
-        # filesystem/history-only flushes do not write UTXO-backed Sapling
-        # indexes, so the DB layer should clear them only after an actual UTXO
-        # flush commits them.
+        # These must be the live lists, not copies: filesystem/history-
+        # only flushes do not write UTXO-backed Sapling indexes, so the
+        # DB layer clears them only after an actual UTXO flush commits
+        # them.
         flush_data.sapling_nullifiers = self.sapling_nullifiers
         flush_data.sapling_commitments = self.sapling_commitments
         flush_data.sapling_anchors = self.sapling_anchors
         flush_data.sapling_delete_nullifiers = self.sapling_undo_nullifiers
         flush_data.sapling_delete_commitments = self.sapling_undo_commitments
-        flush_data.sapling_delete_anchors = self.sapling_undo_anchors
-        flush_data.sapling_backup_height_start = self.height + 1
+        if self._sapling_backup_pending:
+            # self.height is the fork point after backup; the first
+            # reverted height is one above it.  The flag stays set until
+            # the next advance so a failed backup flush cannot leave
+            # stale anchors behind (re-purging the same range before any
+            # advance is idempotent).
+            flush_data.sapling_backup_height_start = self.height + 1
+        flush_data.sapling_output_count = self._sapling_count()
         return flush_data
+
+    def advance_blocks(self, blocks):
+        '''Advance blocks one at a time so each block's header root can
+        be recorded with the tree size after that block.'''
+        # Advancing means any pending backup flush completed durably
+        self._sapling_backup_pending = False
+        for block in blocks:
+            super().advance_blocks([block])
+            self._advance_sapling_anchor(block.header, self.height)
+
+    def _advance_sapling_anchor(self, header: bytes, height: int):
+        '''Record the header's finalsaplingroot with the current tree
+        size, the first time the root appears.'''
+        sapling_start = getattr(self.coin, 'SAPLING_START_HEIGHT', None)
+        if (sapling_start is None or height < sapling_start
+                or len(header) < 112):
+            return
+        root = header[80:112]
+        if root != self._last_sapling_root:
+            self._last_sapling_root = root
+            self.sapling_anchors.append((root, height, self._sapling_count()))
 
     def advance_txs(
             self,
@@ -922,32 +963,29 @@ class PIVXSaplingBlockProcessor(BlockProcessor):
         # Call parent to handle transparent inputs/outputs
         undo_info = super().advance_txs(txs, is_unspendable)
 
-        # Extract Sapling data from transactions
         height = getattr(self, '_advance_block_height', None)
         if height is None:
             height = self.height
-        seen_anchors = set()  # Dedupe anchors within block
+        count = self._sapling_count()
 
         for tx in txs:
             if isinstance(tx, TxPIVXSapling):
                 tx_hash = tx.txid
 
-                # Index nullifiers from spends
                 for spend_idx, spend in enumerate(tx.sapling_spends):
                     self.sapling_nullifiers.append(
                         (spend.nullifier, tx_hash, height, spend_idx)
                     )
-                    # Track unique anchors
-                    if spend.anchor not in seen_anchors:
-                        seen_anchors.add(spend.anchor)
-                        self.sapling_anchors.append((spend.anchor, height))
 
-                # Index commitments from outputs
+                # Global positions are assigned here, in canonical
+                # block/tx/vShieldOutput order
                 for idx, output in enumerate(tx.sapling_outputs):
                     self.sapling_commitments.append(
-                        (output.cmu, tx_hash, idx, height)
+                        (output.cmu, tx_hash, idx, height, count)
                     )
+                    count += 1
 
+        self.sapling_output_count = count
         return undo_info
 
     def backup_txs(
@@ -958,15 +996,19 @@ class PIVXSaplingBlockProcessor(BlockProcessor):
         '''Backup transactions during reorg, including Sapling data.'''
         from electrumx.lib.tx import TxPIVXSapling
 
-        # Collect Sapling data to remove
+        count = self._sapling_count()
         for tx in txs:
             if isinstance(tx, TxPIVXSapling):
                 for spend in tx.sapling_spends:
                     self.sapling_undo_nullifiers.append(spend.nullifier)
-                    self.sapling_undo_anchors.append(spend.anchor)
-
                 for output in tx.sapling_outputs:
                     self.sapling_undo_commitments.append(output.cmu)
+                    count -= 1
+        self.sapling_output_count = count
+        # Roots first seen at reverted heights are purged by height at
+        # the backup flush; roots first seen earlier stay valid
+        self._sapling_backup_pending = True
+        self._last_sapling_root = None
 
         # Call parent backup
         super().backup_txs(txs, is_unspendable)

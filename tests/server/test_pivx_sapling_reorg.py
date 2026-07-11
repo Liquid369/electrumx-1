@@ -1,18 +1,34 @@
+'''Tests for the PIVX Sapling index: DB layer, block processor, and the
+PIVXSaplingElectrumX session RPC surface.
+
+Conventions under test:
+- the index stores all 32-byte values in raw little-endian serialization
+  order; the RPC boundary converts to/from PIVX Core display byte order
+- commitment positions are explicit, assigned by the block processor in
+  canonical order
+- consensus anchors are finalsaplingroot values from block headers
+  (bytes 80:112), recorded first-seen with the tree size at that height
+- witness/anchor responses are validated against those consensus
+  anchors and fail closed on mismatch
+'''
+
 import asyncio
-from collections import defaultdict
-from functools import lru_cache
 import json
 import logging
-import subprocess
+from collections import defaultdict
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
-from aiorpcx import Request, RPCError
+import pytest
+from aiorpcx import ReplyAndDisconnect, Request, RPCError
 
 from electrumx.lib.coins import Pivx, PivxTestnet
 from electrumx.lib import tx as tx_lib
+from electrumx.lib.hash import hash_to_hex_str, hex_str_to_hash
 from electrumx.server.daemon import DaemonError
-from electrumx.server.block_processor import BlockProcessor, PIVXSaplingBlockProcessor
+from electrumx.server.block_processor import (
+    BlockProcessor, PIVXSaplingBlockProcessor)
 from electrumx.server.db import DB, FlushData
 from electrumx.server.session import (
     PIVXSaplingElectrumX,
@@ -20,6 +36,18 @@ from electrumx.server.session import (
     PIVX_SAPLING_RPC_CONTRACT,
     PIVX_SAPLING_WITNESS_HELPER_ENV,
 )
+
+
+def display(raw: bytes) -> str:
+    '''PIVX Core display byte order (uint256 GetHex) of raw LE bytes.'''
+    return raw[::-1].hex()
+
+
+def asym32(*prefix) -> bytes:
+    '''A 32-byte value that is not palindromic, so a missing or double
+    byte-order reversal cannot go unnoticed.'''
+    prefix = bytes(prefix)
+    return (prefix + bytes(range(32)))[:32]
 
 
 class FakeKV:
@@ -43,7 +71,24 @@ class FakeKV:
         return iter(sorted(items, reverse=reverse))
 
 
-def make_sapling_db():
+HEADER_SPACING = 1000
+
+
+class FakeHeadersFile:
+    '''headers_file lookalike keyed on the fake header_offset spacing.'''
+
+    def __init__(self, headers_by_height):
+        self.headers_by_height = headers_by_height
+
+    def read(self, offset, size):
+        return self.headers_by_height.get(offset // HEADER_SPACING, b'')[:size]
+
+
+def make_sapling_db(blocks=()):
+    '''A DB over a fake KV store.  ``blocks`` items need 'height' and
+    'hash' (display hex); items with 'raw' also provide the header for
+    get_sapling_root.  fs_block_hashes serves raw hash bytes whose
+    hash_to_hex_str equals the fixture hash the fake daemon keys on.'''
     db = object.__new__(DB)
     db.utxo_db = FakeKV()
     db.logger = mock.Mock()
@@ -51,18 +96,181 @@ def make_sapling_db():
     db.db_height = 0
     db.db_tx_count = 0
     db.db_tip = b'\0' * 32
-    db.db_version = 8
+    db.db_version = max(DB.DB_VERSIONS)
     db.utxo_flush_count = 0
     db.wall_time = 0
     db.first_sync = False
     db.sapling_output_count = 0
+
+    hashes = {}
+    headers = {}
+    for block in blocks:
+        hashes[block['height']] = hex_str_to_hash(block['hash'])
+        if block.get('raw'):
+            header_len = Pivx.static_header_len(block['height'])
+            headers[block['height']] = block['raw'][:header_len]
+
+    async def fs_block_hashes(height, count):
+        return [hashes[h] for h in range(height, height + count)]
+
+    db.fs_block_hashes = fs_block_hashes
+    db.header_offset = lambda height: height * HEADER_SPACING
+    db.headers_file = FakeHeadersFile(headers)
+    if hashes:
+        db.db_height = max(hashes)
     return db
 
 
-def apply_deletes(db, keys):
-    for key in keys:
-        db.utxo_db.delete(key)
+def load_block_fixture(filename):
+    path = Path(__file__).parents[1] / 'blocks' / filename
+    data = json.loads(path.read_text())
+    data['raw'] = bytes.fromhex(data['block'])
+    return data
 
+
+def parse_block_txs(block):
+    deser = tx_lib.DeserializerPIVX(
+        block['raw'], start=Pivx.static_header_len(block['height']))
+    return [deser.read_tx() for _ in range(deser._read_varint())]
+
+
+def index_block_sapling(db, block, position_start=0):
+    '''Index a fixture block the way the block processor would: explicit
+    canonical positions and the header finalsaplingroot as the anchor.'''
+    nullifiers = []
+    commitments = []
+    position = position_start
+    for tx in parse_block_txs(block):
+        if isinstance(tx, tx_lib.TxPIVXSapling):
+            for spend_index, spend in enumerate(tx.sapling_spends):
+                nullifiers.append((spend.nullifier, tx.txid,
+                                   block['height'], spend_index))
+            for output_index, output in enumerate(tx.sapling_outputs):
+                commitments.append((output.cmu, tx.txid, output_index,
+                                    block['height'], position))
+                position += 1
+    anchors = []
+    if Pivx.static_header_len(block['height']) >= 112:
+        anchors.append((block['raw'][80:112], block['height'], position))
+    db.flush_sapling_data(db.utxo_db, nullifiers, commitments, anchors)
+    db.sapling_output_count = position
+
+
+class FixtureDaemon:
+
+    def __init__(self, blocks):
+        self.blocks_by_hash = {block['hash']: block for block in blocks}
+
+    async def block_hex_hashes(self, *args):
+        raise AssertionError(
+            'the Sapling RPC surface must take block hashes from the '
+            'indexed chain, never the daemon')
+
+    async def raw_blocks(self, block_hashes):
+        return [self.blocks_by_hash[block_hash]['raw']
+                for block_hash in block_hashes]
+
+    async def getnetworkinfo(self):
+        return {
+            'version': 5060100,
+            'subversion': '/PIVX Core:5.6.1/',
+        }
+
+
+class LaggingDaemon(FixtureDaemon):
+
+    def __init__(self, blocks, cached_height):
+        super().__init__(blocks)
+        self._cached_height = cached_height
+
+    def cached_height(self):
+        return self._cached_height
+
+
+def make_session(db, daemon):
+    session = object.__new__(PIVXSaplingElectrumX)
+    session.coin = Pivx
+    session.db = db
+    session.session_mgr = mock.Mock()
+    session.session_mgr.daemon = daemon
+    session.session_mgr._method_counts = defaultdict(int)
+    session.session_mgr._sapling_commitments_cache_key = None
+    session.session_mgr._sapling_commitments_cache = None
+    session.session_mgr._sapling_current_anchor_cache_key = None
+    session.session_mgr._sapling_current_anchor_cache = None
+    session.logger = logging.getLogger('test-pivx-sapling')
+    session.bump_cost = lambda _cost: None
+    session.sv_seen = False
+    session.sv_negotiated = asyncio.Event()
+
+    async def daemon_request(method, *args):
+        return await getattr(daemon, method)(*args)
+
+    session.daemon_request = daemon_request
+    return session
+
+
+def install_fake_helper(session, response=None,
+                        helper_path='/fake/pivx_sapling_witness'):
+    '''Replace the witness helper subprocess with a canned response.
+    Returns the list of payloads the helper was called with.'''
+    calls = []
+
+    async def fake_helper(payload):
+        calls.append(payload)
+        return response
+
+    session._sapling_call_witness_helper = fake_helper
+    session._sapling_witness_helper_path = lambda: Path(helper_path)
+    return calls
+
+
+def run(coro):
+    return asyncio.get_event_loop().run_until_complete(coro)
+
+
+def make_sapling_tx(tag, num_spends=0, num_outputs=0):
+    spends = [
+        tx_lib.SaplingSpend(
+            cv=bytes(32), anchor=bytes(32),
+            nullifier=asym32(0xF0, tag, n),
+            rk=bytes(32), zkproof=bytes(192), spend_auth_sig=bytes(64))
+        for n in range(num_spends)
+    ]
+    outputs = [
+        tx_lib.SaplingOutput(
+            cv=bytes(32), cmu=asym32(0xC0, tag, n),
+            ephemeral_key=bytes(32), enc_ciphertext=bytes(580),
+            out_ciphertext=bytes(80), zkproof=bytes(192))
+        for n in range(num_outputs)
+    ]
+    return tx_lib.TxPIVXSapling(
+        version=3, txtype=0, inputs=[], outputs=[], locktime=0,
+        txid=bytes([tag]) * 32, wtxid=bytes([tag]) * 32,
+        value_balance=0, sapling_spends=spends, sapling_outputs=outputs,
+        binding_sig=bytes(64),
+    )
+
+
+def make_processor(db=None, height=0, coin=Pivx):
+    processor = object.__new__(PIVXSaplingBlockProcessor)
+    processor.coin = coin
+    processor.db = db
+    processor.height = height
+    processor.sapling_nullifiers = []
+    processor.sapling_commitments = []
+    processor.sapling_anchors = []
+    processor.sapling_undo_nullifiers = []
+    processor.sapling_undo_commitments = []
+    processor._sapling_backup_pending = False
+    processor.sapling_output_count = None
+    processor._last_sapling_root = None
+    return processor
+
+
+# ---------------------------------------------------------------------------
+# Rollback policy
+# ---------------------------------------------------------------------------
 
 def test_pivx_sapling_rollback_policy_and_activation_heights():
     assert Pivx.REORG_LIMIT >= 100
@@ -86,33 +294,30 @@ def test_client_rescan_start_covers_full_rollback_window_from_activation():
             - rescan_start(Pivx.SAPLING_START_HEIGHT + 100) + 1) == Pivx.REORG_LIMIT
 
 
-def test_sapling_reorg_removes_outputs_spends_anchors_roots_and_positions():
+# ---------------------------------------------------------------------------
+# DB layer
+# ---------------------------------------------------------------------------
+
+def test_sapling_reorg_removes_outputs_spends_positions_and_anchors():
     db = make_sapling_db()
-    kept_cm = b'c' * 32
-    removed_cm = b'd' * 32
-    kept_nf = b'n' * 32
-    removed_nf = b'o' * 32
-    kept_anchor = b'a' * 32
-    removed_anchor = b'b' * 32
+    kept_cm = asym32(0x01)
+    removed_cm = asym32(0x02)
+    kept_nf = asym32(0x03)
+    removed_nf = asym32(0x04)
+    kept_anchor = asym32(0x05)
+    removed_anchor = asym32(0x06)
 
     db.flush_sapling_data(
         db.utxo_db,
         [(kept_nf, b'K' * 32, 149, 0),
          (removed_nf, b'R' * 32, 150, 1)],
-        [(kept_cm, b'C' * 32, 0, 149),
-         (removed_cm, b'D' * 32, 1, 150)],
-        [(kept_anchor, 149), (removed_anchor, 150)],
+        [(kept_cm, b'C' * 32, 0, 149, 0),
+         (removed_cm, b'D' * 32, 1, 150, 1)],
+        [(kept_anchor, 149, 1), (removed_anchor, 150, 2)],
     )
-    kept_root = DB.sapling_root_from_commitments([kept_cm])
-    removed_root = DB.sapling_root_from_commitments([kept_cm, removed_cm])
 
-    deletes = []
-    batch = mock.Mock()
-    batch.delete.side_effect = deletes.append
     db.backup_sapling_data(
-        batch, [removed_nf], [removed_cm], [removed_anchor],
-        height_start=150)
-    apply_deletes(db, deletes)
+        db.utxo_db, [removed_nf], [removed_cm], height_start=150)
 
     assert db.get_nullifier_spend(kept_nf) == (b'K' * 32, 149, 0)
     assert db.get_nullifier_spend(removed_nf) is None
@@ -122,24 +327,19 @@ def test_sapling_reorg_removes_outputs_spends_anchors_roots_and_positions():
     assert db.get_sapling_output_by_position(1) is None
     assert db.get_anchor_height(kept_anchor) == 149
     assert db.get_anchor_height(removed_anchor) is None
-    assert db.get_sapling_root_info(kept_root) == (1, 149)
-    assert db.get_sapling_root_info(removed_root) is None
-    assert db.sapling_output_count == 1
+    assert db.get_sapling_anchor_info(kept_anchor) == (149, 1)
+    assert db.get_sapling_anchor_info(removed_anchor) is None
 
 
 def test_reorg_can_respend_nullifier_on_different_branch():
     db = make_sapling_db()
-    nullifier = b'x' * 32
+    nullifier = asym32(0x11)
 
     db.flush_sapling_data(db.utxo_db, [(nullifier, b'o' * 32, 200, 0)],
                           [], [])
     assert db.get_nullifier_spend(nullifier) == (b'o' * 32, 200, 0)
 
-    deletes = []
-    batch = mock.Mock()
-    batch.delete.side_effect = deletes.append
-    db.backup_sapling_data(batch, [nullifier], [], [], height_start=200)
-    apply_deletes(db, deletes)
+    db.backup_sapling_data(db.utxo_db, [nullifier], [], height_start=200)
     assert db.get_nullifier_spend(nullifier) is None
 
     db.flush_sapling_data(db.utxo_db, [(nullifier, b'p' * 32, 201, 1)],
@@ -147,204 +347,486 @@ def test_reorg_can_respend_nullifier_on_different_branch():
     assert db.get_nullifier_spend(nullifier) == (b'p' * 32, 201, 1)
 
 
-def load_block_fixture(filename):
-    path = Path(__file__).parents[1] / 'blocks' / filename
-    data = json.loads(path.read_text())
-    data['raw'] = bytes.fromhex(data['block'])
-    return data
+def test_anchor_first_seen_is_not_overwritten_by_later_reappearance():
+    db = make_sapling_db()
+    root = asym32(0x21)
+
+    db.flush_sapling_data(db.utxo_db, [], [], [(root, 100, 5)])
+    # The same consensus root re-appears later (e.g. blocks without
+    # Sapling activity after a restart): put-if-absent keeps the first
+    # sighting.
+    db.flush_sapling_data(db.utxo_db, [], [], [(root, 200, 9)])
+
+    assert db.get_sapling_anchor_info(root) == (100, 5)
 
 
-def parse_block_txs(block):
-    deser = tx_lib.DeserializerPIVX(
-        block['raw'], start=Pivx.static_header_len(block['height']))
-    return [deser.read_tx() for _ in range(deser._read_varint())]
+def test_anchor_survives_reorg_of_later_height_where_it_reappeared():
+    db = make_sapling_db()
+    root = asym32(0x22)
+
+    db.flush_sapling_data(db.utxo_db, [], [], [(root, 100, 5)])
+    db.flush_sapling_data(db.utxo_db, [], [], [(root, 200, 9)])
+
+    # Reorg reverting heights >= 150: the root was first seen at 100,
+    # so it is still an anchor of the surviving branch.
+    db.backup_sapling_data(db.utxo_db, [], [], height_start=150)
+
+    assert db.get_sapling_anchor_info(root) == (100, 5)
 
 
-@lru_cache
-def build_witness_helper():
-    root = Path(__file__).parents[2]
-    manifest = root / 'contrib/pivx_sapling_witness/Cargo.toml'
-    binary = root / 'contrib/pivx_sapling_witness/target/debug/pivx_sapling_witness'
-    subprocess.run(
-        ['cargo', 'build', '--manifest-path', str(manifest)],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
+def test_anchors_first_seen_at_reverted_heights_are_purged():
+    db = make_sapling_db()
+    old_root = asym32(0x23)
+    new_root = asym32(0x24)
+
+    db.flush_sapling_data(db.utxo_db, [], [],
+                          [(old_root, 149, 3), (new_root, 160, 7)])
+    db.backup_sapling_data(db.utxo_db, [], [], height_start=150)
+
+    assert db.get_sapling_anchor_info(old_root) == (149, 3)
+    assert db.get_sapling_anchor_info(new_root) is None
+
+
+def test_backup_without_height_start_keeps_anchors():
+    db = make_sapling_db()
+    root = asym32(0x25)
+    db.flush_sapling_data(db.utxo_db, [], [], [(root, 300, 2)])
+
+    db.backup_sapling_data(db.utxo_db, [], [], height_start=None)
+
+    assert db.get_sapling_anchor_info(root) == (300, 2)
+
+
+def test_explicit_positions_round_trip_through_both_indexes():
+    db = make_sapling_db()
+    first = asym32(0x31)
+    second = asym32(0x32)
+
+    # Positions are assigned by the block processor; empty flushes in
+    # between must not disturb them.
+    db.flush_sapling_data(db.utxo_db, [], [(first, b'a' * 32, 0, 200, 0)], [])
+    db.flush_sapling_data(db.utxo_db, [], [], [])
+    db.flush_sapling_data(db.utxo_db, [], [(second, b'b' * 32, 0, 202, 1)], [])
+
+    assert db.get_commitment_position_info(first) == (b'a' * 32, 0, 200, 0)
+    assert db.get_commitment_position_info(second) == (b'b' * 32, 0, 202, 1)
+    assert db.get_commitment_position(first) == 0
+    assert db.get_commitment_position(second) == 1
+    assert db.get_sapling_output_by_position(0) == (first, b'a' * 32, 0, 200, 0)
+    assert db.get_sapling_output_by_position(1) == (second, b'b' * 32, 0, 202, 1)
+
+
+def test_sapling_tree_size_at_binary_search():
+    db = make_sapling_db()
+    heights = [100, 100, 101, 103, 103, 107]
+    db.flush_sapling_data(
+        db.utxo_db,
+        [],
+        [(asym32(0x40, n), bytes([0x50 + n]) * 32, 0, height, n)
+         for n, height in enumerate(heights)],
+        [],
     )
-    return binary
+    db.sapling_output_count = len(heights)
+
+    assert db.sapling_tree_size_at(99) == 0
+    assert db.sapling_tree_size_at(100) == 2
+    assert db.sapling_tree_size_at(101) == 3
+    assert db.sapling_tree_size_at(102) == 3
+    assert db.sapling_tree_size_at(103) == 5
+    assert db.sapling_tree_size_at(106) == 5
+    assert db.sapling_tree_size_at(107) == 6
+    assert db.sapling_tree_size_at(10**9) == 6
 
 
-def canonical_cmu(value):
-    return value.to_bytes(32, 'little')
+def test_sapling_tree_size_at_missing_position_raises():
+    db = make_sapling_db()
+    db.sapling_output_count = 2  # but no b'P' entries exist
+    with pytest.raises(DB.DBError, match='missing Sapling output position'):
+        db.sapling_tree_size_at(100)
 
 
-def verify_witness_with_helper(response):
-    helper = build_witness_helper()
-    payload = {
-        'mode': 'verify',
-        'commitment': response['commitment'],
-        'position': response['position'],
-        'anchor': response['anchor'],
-        'path': response['path'],
-    }
-    proc = subprocess.run(
-        [str(helper)],
-        input=json.dumps(payload),
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    verified = json.loads(proc.stdout)
-    assert verified['success'] is True
-    assert verified['root'] == response['anchor']
-
-
-def index_block_sapling(db, block):
-    nullifiers = []
-    commitments = []
-    anchors = []
-    seen_anchors = set()
-    for tx in parse_block_txs(block):
-        if isinstance(tx, tx_lib.TxPIVXSapling):
-            for spend_index, spend in enumerate(tx.sapling_spends):
-                nullifiers.append((spend.nullifier, tx.txid,
-                                   block['height'], spend_index))
-                if spend.anchor not in seen_anchors:
-                    anchors.append((spend.anchor, block['height']))
-                    seen_anchors.add(spend.anchor)
-            for output_index, output in enumerate(tx.sapling_outputs):
-                commitments.append((output.cmu, tx.txid, output_index,
-                                    block['height']))
-    db.flush_sapling_data(db.utxo_db, nullifiers, commitments, anchors)
-
-
-def test_sapling_block_processor_indexes_current_block_height(monkeypatch):
+def test_get_sapling_root_reads_header_bytes_80_112():
     block = load_block_fixture('pivx_mainnet_2703076.json')
-    txs = parse_block_txs(block)
-    processor = object.__new__(PIVXSaplingBlockProcessor)
-    processor.height = block['height'] - 1
-    processor._advance_block_height = block['height']
-    processor.sapling_nullifiers = []
-    processor.sapling_commitments = []
-    processor.sapling_anchors = []
+    db = make_sapling_db([block])
 
-    monkeypatch.setattr(
-        BlockProcessor,
-        'advance_txs',
-        lambda _self, _txs, _is_unspendable: [],
+    root = db.get_sapling_root(block['height'])
+    assert root == block['raw'][80:112]
+    # Above the DB tip: not served
+    assert db.get_sapling_root(block['height'] + 1) is None
+    # Below activation: headers carry no Sapling root
+    assert db.get_sapling_root(Pivx.SAPLING_START_HEIGHT - 1) is None
+
+
+def test_get_sapling_root_requires_expanded_header():
+    block = load_block_fixture('pivx_mainnet_2703076.json')
+    short = {'height': block['height'], 'hash': block['hash'],
+             'raw': block['raw'][:80]}
+    db = make_sapling_db([short])
+    db.headers_file = FakeHeadersFile({block['height']: block['raw'][:80]})
+
+    assert db.get_sapling_root(block['height']) is None
+
+
+def test_legacy_synthetic_tree_apis_are_removed():
+    for name in (
+            'sapling_root_from_commitments',
+            'get_sapling_root_info',
+            'get_sapling_witness',
+            'sapling_witness_path',
+            'get_sapling_tree_state',
+            'iter_sapling_nullifiers_by_height',
+            'iter_sapling_commitments_by_height',
+            'count_sapling_nullifiers',
+            'count_sapling_commitments',
+    ):
+        assert not hasattr(DB, name)
+
+
+def test_sapling_positions_remain_stable_across_restart():
+    db = make_sapling_db()
+    commitments = [asym32(0x60, n) for n in range(3)]
+    db.db_height = 101
+    db.flush_sapling_data(
+        db.utxo_db,
+        [],
+        [(commitments[0], b'a' * 32, 0, 100, 0),
+         (commitments[1], b'b' * 32, 1, 100, 1),
+         (commitments[2], b'c' * 32, 0, 101, 2)],
+        [],
     )
+    db.sapling_output_count = 3
+    db.write_utxo_state(db.utxo_db)
+
+    restarted = make_sapling_db()
+    restarted.utxo_db = db.utxo_db
+    restarted.read_utxo_state()
+
+    assert restarted.sapling_output_count == 3
+    assert [restarted.get_commitment_position_info(c)[3]
+            for c in commitments] == [0, 1, 2]
+
+
+def _utxo_state(**overrides):
+    state = {
+        'genesis': Pivx.GENESIS_HASH,
+        'height': Pivx.SAPLING_START_HEIGHT + 10,
+        'tx_count': 1,
+        'tip': b'\1' * 32,
+        'utxo_flush_count': 1,
+        'wall_time': 0,
+        'first_sync': False,
+        'db_version': max(DB.DB_VERSIONS),
+        'sapling_output_count': 5,
+    }
+    state.update(overrides)
+    return state
+
+
+def test_read_utxo_state_forces_resync_without_sapling_index_version():
+    db = make_sapling_db()
+    db.utxo_db.put(b'state', repr(_utxo_state()).encode())
+
+    with pytest.raises(DB.DBError, match='resync'):
+        db.read_utxo_state()
+
+
+def test_read_utxo_state_forces_resync_on_wrong_sapling_index_version():
+    db = make_sapling_db()
+    state = _utxo_state(
+        sapling_index_version=DB.SAPLING_INDEX_VERSION + 1)
+    db.utxo_db.put(b'state', repr(state).encode())
+
+    with pytest.raises(DB.DBError, match='resync'):
+        db.read_utxo_state()
+
+
+def test_read_utxo_state_pre_activation_needs_no_sapling_index_version():
+    db = make_sapling_db()
+    state = _utxo_state(height=Pivx.SAPLING_START_HEIGHT - 1)
+    db.utxo_db.put(b'state', repr(state).encode())
+
+    db.read_utxo_state()
+
+    assert db.db_height == Pivx.SAPLING_START_HEIGHT - 1
+    assert db.sapling_output_count == 5
+
+
+def test_write_utxo_state_stamps_sapling_index_version():
+    assert DB.SAPLING_INDEX_VERSION == 1
+    db = make_sapling_db()
+    db.db_height = Pivx.SAPLING_START_HEIGHT + 10
+    db.sapling_output_count = 42
+    db.write_utxo_state(db.utxo_db)
+
+    restarted = make_sapling_db()
+    restarted.utxo_db = db.utxo_db
+    restarted.read_utxo_state()
+
+    assert restarted.db_height == Pivx.SAPLING_START_HEIGHT + 10
+    assert restarted.sapling_output_count == 42
+
+
+def test_flush_utxo_db_persists_sapling_data_and_output_count():
+    db = make_sapling_db()
+    db.history = mock.Mock(flush_count=7)
+    nf = asym32(0x71)
+    cm = asym32(0x72)
+    root = asym32(0x73)
+    flush_data = FlushData(
+        5, 9, [], [], [], {}, [], b't' * 32,
+        sapling_nullifiers=[(nf, b'h' * 32, 5, 0)],
+        sapling_commitments=[(cm, b'h' * 32, 0, 5, 0)],
+        sapling_anchors=[(root, 5, 1)],
+        sapling_output_count=1,
+    )
+
+    db.flush_utxo_db(db.utxo_db, flush_data)
+
+    # Persisted atomically with the UTXO flush
+    assert db.sapling_output_count == 1
+    assert db.db_height == 5
+    assert db.get_nullifier_spend(nf) == (b'h' * 32, 5, 0)
+    assert db.get_commitment_position_info(cm) == (b'h' * 32, 0, 5, 0)
+    assert db.get_sapling_anchor_info(root) == (5, 1)
+    # The live lists are cleared only once actually flushed
+    assert flush_data.sapling_nullifiers == []
+    assert flush_data.sapling_commitments == []
+    assert flush_data.sapling_anchors == []
+
+
+def test_flush_utxo_db_applies_pending_backup_purge():
+    db = make_sapling_db()
+    db.history = mock.Mock(flush_count=7)
+    nf = asym32(0x74)
+    cm = asym32(0x75)
+    kept_root = asym32(0x76)
+    reverted_root = asym32(0x77)
+    db.flush_sapling_data(
+        db.utxo_db,
+        [(nf, b'h' * 32, 150, 0)],
+        [(cm, b'h' * 32, 0, 150, 0)],
+        [(kept_root, 100, 0), (reverted_root, 150, 1)],
+    )
+
+    flush_data = FlushData(
+        149, 9, [], [], [], {}, [], b't' * 32,
+        sapling_delete_nullifiers=[nf],
+        sapling_delete_commitments=[cm],
+        sapling_backup_height_start=150,
+        sapling_output_count=0,
+    )
+    db.flush_utxo_db(db.utxo_db, flush_data)
+
+    assert db.sapling_output_count == 0
+    assert db.get_nullifier_spend(nf) is None
+    assert db.get_commitment_position_info(cm) is None
+    assert db.get_sapling_output_by_position(0) is None
+    assert db.get_sapling_anchor_info(kept_root) == (100, 0)
+    assert db.get_sapling_anchor_info(reverted_root) is None
+    assert flush_data.sapling_delete_nullifiers == []
+    assert flush_data.sapling_delete_commitments == []
+
+
+# ---------------------------------------------------------------------------
+# Block processor
+# ---------------------------------------------------------------------------
+
+def test_advance_txs_assigns_positions_in_canonical_order(monkeypatch):
+    monkeypatch.setattr(
+        BlockProcessor, 'advance_txs',
+        lambda _self, _txs, _is_unspendable: [])
+    db = make_sapling_db()
+    db.sapling_output_count = 7  # lazily seeds the in-memory counter
+    processor = make_processor(db=db, height=299)
+    processor._advance_block_height = 300
+
+    tx_a = make_sapling_tx(1, num_spends=1, num_outputs=2)
+    plain = tx_lib.TxPIVX(version=1, txtype=0, inputs=[], outputs=[],
+                          locktime=0, txid=b'p' * 32, wtxid=b'p' * 32)
+    tx_b = make_sapling_tx(2, num_outputs=1)
+
+    processor.advance_txs([tx_a, plain, tx_b], lambda _script: False)
+
+    assert processor.sapling_commitments == [
+        (tx_a.sapling_outputs[0].cmu, tx_a.txid, 0, 300, 7),
+        (tx_a.sapling_outputs[1].cmu, tx_a.txid, 1, 300, 8),
+        (tx_b.sapling_outputs[0].cmu, tx_b.txid, 0, 300, 9),
+    ]
+    assert processor.sapling_nullifiers == [
+        (tx_a.sapling_spends[0].nullifier, tx_a.txid, 300, 0),
+    ]
+    assert processor.sapling_output_count == 10
+
+
+def test_advance_txs_indexes_current_block_height_from_fixture(monkeypatch):
+    block = load_block_fixture('pivx_mainnet_5057529.json')
+    txs = parse_block_txs(block)
+    monkeypatch.setattr(
+        BlockProcessor, 'advance_txs',
+        lambda _self, _txs, _is_unspendable: [])
+    processor = make_processor(height=block['height'] - 1)
+    processor.sapling_output_count = 0
+    processor._advance_block_height = block['height']
 
     processor.advance_txs(txs, lambda _script: False)
 
+    assert processor.sapling_commitments
+    assert processor.sapling_nullifiers
     indexed_heights = (
         [item[2] for item in processor.sapling_nullifiers]
         + [item[3] for item in processor.sapling_commitments]
-        + [item[1] for item in processor.sapling_anchors]
     )
-    assert indexed_heights
     assert set(indexed_heights) == {block['height']}
+    assert [item[4] for item in processor.sapling_commitments] == [0, 1]
 
 
-def test_sapling_flush_data_keeps_live_lists_until_utxo_flush(monkeypatch):
-    processor = object.__new__(PIVXSaplingBlockProcessor)
-    processor.height = 123
-    processor.sapling_nullifiers = [(b'n' * 32, b't' * 32, 123, 0)]
-    processor.sapling_commitments = [(b'c' * 32, b't' * 32, 0, 123)]
-    processor.sapling_anchors = [(b'a' * 32, 123)]
-    processor.sapling_undo_nullifiers = []
-    processor.sapling_undo_commitments = []
-    processor.sapling_undo_anchors = []
-    base_flush_data = FlushData(
-        123, 10, [], [], [], {}, [], b'h' * 32,
-    )
+def test_advance_blocks_records_first_seen_header_anchors(monkeypatch):
+    # PivxTestnet activation is 201, keeping the fixture small
+    def fake_advance(self, blocks):
+        self.height += len(blocks)
+        self.sapling_output_count += 2  # pretend each block adds outputs
 
+    monkeypatch.setattr(BlockProcessor, 'advance_blocks', fake_advance)
+    processor = make_processor(height=199, coin=PivxTestnet)
+    processor.sapling_output_count = 3
+
+    root_a = asym32(0xA1)
+    root_b = asym32(0xB1)
+
+    def block(root, header_len=112):
+        header = (bytes(80) + root)[:header_len]
+        return SimpleNamespace(header=header)
+
+    processor.advance_blocks([
+        block(root_a),            # height 200: below activation, ignored
+        block(root_a),            # height 201: first appearance, recorded
+        block(root_a),            # height 202: unchanged root, skipped
+        block(root_b),            # height 203: new root, recorded
+        block(root_b, header_len=80),  # height 204: short header, ignored
+    ])
+
+    assert processor.height == 204
+    # tree size recorded is the count after each recording block
+    assert processor.sapling_anchors == [
+        (root_a, 201, 7),
+        (root_b, 203, 11),
+    ]
+
+
+def test_backup_txs_rewinds_count_and_marks_backup_pending(monkeypatch):
     monkeypatch.setattr(
-        BlockProcessor,
-        'flush_data',
-        lambda _self: base_flush_data,
-    )
+        BlockProcessor, 'backup_txs',
+        lambda _self, _txs, _is_unspendable: None)
+    processor = make_processor(height=250)
+    processor.sapling_output_count = 10
+    processor._last_sapling_root = asym32(0xA2)
+
+    tx_a = make_sapling_tx(3, num_spends=1, num_outputs=2)
+    tx_b = make_sapling_tx(4, num_outputs=1)
+
+    processor.backup_txs([tx_a, tx_b], lambda _script: False)
+
+    assert processor.sapling_output_count == 7
+    assert processor.sapling_undo_nullifiers == [
+        tx_a.sapling_spends[0].nullifier]
+    assert set(processor.sapling_undo_commitments) == {
+        tx_a.sapling_outputs[0].cmu, tx_a.sapling_outputs[1].cmu,
+        tx_b.sapling_outputs[0].cmu}
+    assert processor._sapling_backup_pending is True
+    assert processor._last_sapling_root is None
+
+
+def test_flush_data_passes_live_lists_count_and_backup_height(monkeypatch):
+    monkeypatch.setattr(
+        BlockProcessor, 'flush_data',
+        lambda _self: FlushData(123, 10, [], [], [], {}, [], b'h' * 32))
+    processor = make_processor(height=123)
+    processor.sapling_output_count = 6
+    processor.sapling_nullifiers = [(asym32(0xA3), b't' * 32, 123, 0)]
+    processor.sapling_commitments = [(asym32(0xA4), b't' * 32, 0, 123, 5)]
+    processor.sapling_anchors = [(asym32(0xA5), 123, 6)]
+    processor.sapling_undo_nullifiers = [asym32(0xA6)]
+    processor.sapling_undo_commitments = [asym32(0xA7)]
 
     flush_data = processor.flush_data()
 
+    # Live lists, not copies: history-only flushes must not lose data
     assert flush_data.sapling_nullifiers is processor.sapling_nullifiers
     assert flush_data.sapling_commitments is processor.sapling_commitments
     assert flush_data.sapling_anchors is processor.sapling_anchors
-    assert processor.sapling_commitments
+    assert flush_data.sapling_delete_nullifiers is (
+        processor.sapling_undo_nullifiers)
+    assert flush_data.sapling_delete_commitments is (
+        processor.sapling_undo_commitments)
+    assert flush_data.sapling_output_count == 6
+    # No backup pending: no purge height
+    assert flush_data.sapling_backup_height_start is None
     flush_data.sapling_commitments.clear()
     assert processor.sapling_commitments == []
 
-
-class FixtureDaemon:
-
-    def __init__(self, blocks):
-        self.blocks_by_height = {block['height']: block for block in blocks}
-        self.blocks_by_hash = {block['hash']: block for block in blocks}
-
-    async def block_hex_hashes(self, start_height, count):
-        return [
-            self.blocks_by_height[height]['hash']
-            for height in range(start_height, start_height + count)
-        ]
-
-    async def raw_blocks(self, block_hashes):
-        return [self.blocks_by_hash[block_hash]['raw']
-                for block_hash in block_hashes]
-
-    async def getnetworkinfo(self):
-        return {
-            'version': 5060100,
-            'subversion': '/PIVX Core:5.6.1/',
-        }
+    # With a pending backup the first reverted height is height+1.
+    # The flag survives flush_data so a failed backup flush can be
+    # retried; it clears when the next advance begins.
+    processor._sapling_backup_pending = True
+    flush_data = processor.flush_data()
+    assert flush_data.sapling_backup_height_start == 124
+    assert processor._sapling_backup_pending is True
+    flush_data = processor.flush_data()
+    assert flush_data.sapling_backup_height_start == 124
+    processor.advance_blocks([])
+    assert processor._sapling_backup_pending is False
 
 
-def make_session(db, daemon):
-    session = object.__new__(PIVXSaplingElectrumX)
-    session.coin = Pivx
-    session.db = db
-    session.session_mgr = mock.Mock()
-    session.session_mgr.daemon = daemon
-    session.session_mgr._method_counts = defaultdict(int)
-    session.logger = logging.getLogger('test-pivx-sapling')
-    session.bump_cost = lambda _cost: None
-
-    async def daemon_request(method, *args):
-        return await getattr(daemon, method)(*args)
-
-    session.daemon_request = daemon_request
-    return session
-
-
-def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
-
-
-def test_client_can_rescan_full_pivx_rollback_boundary_with_hashes():
-    block = load_block_fixture('pivx_mainnet_2703076.json')
+def test_positions_rewound_after_reorg_via_processor_count(monkeypatch):
+    monkeypatch.setattr(
+        BlockProcessor, 'advance_txs',
+        lambda _self, _txs, _is_unspendable: [])
+    monkeypatch.setattr(
+        BlockProcessor, 'backup_txs',
+        lambda _self, _txs, _is_unspendable: None)
     db = make_sapling_db()
-    index_block_sapling(db, block)
-    session = make_session(db, FixtureDaemon([block]))
+    processor = make_processor(db=db, height=299)
 
-    response = run(session.sapling_get_block_range(
-        block['height'], block['height']))
+    # Advance a block with two outputs at positions 0 and 1
+    old_branch_tx = make_sapling_tx(5, num_outputs=2)
+    processor._advance_block_height = 300
+    processor.advance_txs([old_branch_tx], lambda _script: False)
+    db.flush_sapling_data(db.utxo_db, processor.sapling_nullifiers,
+                          processor.sapling_commitments,
+                          processor.sapling_anchors)
+    db.sapling_output_count = processor.sapling_output_count
+    processor.sapling_commitments.clear()
+    assert db.sapling_output_count == 2
 
-    assert response['success'] is True
-    assert response['complete'] is True
-    assert response['empty'] is False
-    assert response['height_count'] == 1
-    assert response['block_hashes'] == [
-        {'height': block['height'], 'block_hash': block['hash']}
+    # Reorg: revert the block, then flush the deletions
+    processor.backup_txs([old_branch_tx], lambda _script: False)
+    processor.height = 299  # fork point after backup
+    db.backup_sapling_data(db.utxo_db, processor.sapling_undo_nullifiers,
+                           processor.sapling_undo_commitments,
+                           height_start=processor.height + 1)
+    db.sapling_output_count = processor.sapling_output_count
+    assert processor.sapling_output_count == 0
+    assert db.get_sapling_output_by_position(0) is None
+    assert db.get_sapling_output_by_position(1) is None
+
+    # The replacement branch reuses the rewound positions
+    new_branch_tx = make_sapling_tx(6, num_outputs=1)
+    processor._advance_block_height = 300
+    processor.advance_txs([new_branch_tx], lambda _script: False)
+    assert processor.sapling_commitments == [
+        (new_branch_tx.sapling_outputs[0].cmu, new_branch_tx.txid, 0, 300, 0),
     ]
-    stale_local_hashes = {block['height']: 'ff' * 32}
-    mismatches = [
-        item['height']
-        for item in response['block_hashes']
-        if stale_local_hashes[item['height']] != item['block_hash']
-    ]
-    assert mismatches == [block['height']]
 
 
-def test_sapling_capabilities_do_not_advertise_release_ready_without_witness_backend():
+# ---------------------------------------------------------------------------
+# Session: capabilities, aliases, envelopes
+# ---------------------------------------------------------------------------
+
+def test_sapling_capabilities_do_not_advertise_release_ready_without_witness_backend(
+        monkeypatch):
+    monkeypatch.delenv(PIVX_SAPLING_WITNESS_HELPER_ENV, raising=False)
+    monkeypatch.setattr('electrumx.server.session.shutil.which',
+                        lambda _name: None)
     session = make_session(make_sapling_db(), FixtureDaemon([]))
 
     capabilities = run(session.sapling_capabilities())
@@ -365,10 +847,18 @@ def test_sapling_capabilities_do_not_advertise_release_ready_without_witness_bac
         'structured_errors': True,
         'canonical_witnesses': False,
     }
+    assert capabilities['hex_byte_order'] == 'display'
+    assert capabilities['consensus_anchors'] is True
     assert capabilities['range_response_format'][
         'global_output_positions'] is True
     assert capabilities['range_response_format']['block_hashes'] is True
-    assert 'unsupported_method' in capabilities['range_error_types']
+    for error_type in ('invalid_range', 'index_incomplete', 'index_error',
+                       'missing_block', 'unsupported_method'):
+        assert error_type in capabilities['range_error_types']
+    # Removed by the indexed-chain redesign: hashes come from the index,
+    # which is complete by construction
+    for legacy in ('missing_block_hash', 'partial_index', 'pruned_range'):
+        assert legacy not in capabilities['range_error_types']
     assert capabilities['witness_response'] == 'unavailable'
     assert 'witness_backend_unavailable' in capabilities[
         'witness_error_types']
@@ -384,8 +874,11 @@ def test_sapling_capabilities_do_not_advertise_release_ready_without_witness_bac
         'blockchain.sapling.get_block_range']
 
 
-def test_sapling_capabilities_advertise_canonical_witness_backend(monkeypatch):
-    helper = build_witness_helper()
+def test_sapling_capabilities_advertise_canonical_witness_backend(
+        monkeypatch, tmp_path):
+    helper = tmp_path / 'pivx_sapling_witness'
+    helper.write_text('#!/bin/sh\nexit 1\n')
+    helper.chmod(0o755)
     monkeypatch.setenv(PIVX_SAPLING_WITNESS_HELPER_ENV, str(helper))
     session = make_session(make_sapling_db(), FixtureDaemon([]))
 
@@ -465,7 +958,10 @@ def test_sapling_capabilities_do_not_advertise_v1_if_not_release_ready():
     assert capabilities['release_contract_ready'] is False
 
 
-def test_sapling_capabilities_request_handler_is_awaitable():
+def test_sapling_capabilities_request_handler_is_awaitable(monkeypatch):
+    monkeypatch.delenv(PIVX_SAPLING_WITNESS_HELPER_ENV, raising=False)
+    monkeypatch.setattr('electrumx.server.session.shutil.which',
+                        lambda _name: None)
     session = make_session(make_sapling_db(), FixtureDaemon([]))
     session.request_handlers = {
         'blockchain.sapling.capabilities': session.sapling_capabilities,
@@ -493,99 +989,158 @@ def test_sapling_unknown_contract_method_returns_structured_error():
     assert 'blockchain.sapling.get_block_range' in response['supported_methods']
 
 
-def test_sapling_best_anchor_fails_closed_without_canonical_backend():
-    # Legacy daemon/tree-state anchors use a different node encoding than
-    # canonical helper witness roots, so a client binding a witness to one can
-    # never validate it. Without the canonical witness backend the v1 method
-    # must return a structured unavailable response, never a legacy anchor.
-    block = load_block_fixture('pivx_mainnet_2703076.json')
-    db = make_sapling_db()
-    db.db_height = block['height']
-    anchor = b'a' * 32
-    db.flush_sapling_data(db.utxo_db, [], [], [(anchor, block['height'])])
-    session = make_session(db, FixtureDaemon([block]))
-
-    response = run(session.sapling_get_best_anchor())
-
-    assert response['available'] is False
-    assert response['anchor'] is None
-    assert response['root'] is None
-    assert response['height'] == block['height']
-    assert response['anchor_height'] is None
-    assert response['block_hash'] == block['hash']
-    assert response['error']['type'] == 'canonical_anchor_unavailable'
-
-
-def test_sapling_best_anchor_returns_structured_response_without_anchor():
-    block = load_block_fixture('pivx_mainnet_10000.json')
-    db = make_sapling_db()
-    db.db_height = block['height']
-    session = make_session(db, FixtureDaemon([block]))
-
-    response = run(session.sapling_get_best_anchor())
-
-    assert response['available'] is False
-    assert response['anchor'] is None
-    assert response['anchor_height'] is None
-    assert response['height'] == block['height']
-    assert response['block_hash'] == block['hash']
-    assert response['error']['type'] == 'canonical_anchor_unavailable'
-
-
-def test_unknown_commitment_info_returns_structured_absent_response():
-    db = make_sapling_db()
-    session = make_session(db, FixtureDaemon([]))
-
-    response = run(session.commitment_get_info('00' * 32))
-
-    assert response == {
-        'exists': False,
-        'txid': None,
-        'output_index': None,
-        'height': None,
-        'position': None,
-    }
-
-
-def test_unknown_nullifier_status_returns_structured_unspent_response():
-    db = make_sapling_db()
-    session = make_session(db, FixtureDaemon([]))
-
-    response = run(session.sapling_get_nullifier_status('00' * 32))
-
-    assert response == {
-        'spent': False,
-        'tx_hash': None,
-        'txid': None,
-        'height': None,
-        'spend_index': None,
-    }
-
-
-def test_live_helper_methods_do_not_leak_internal_errors():
-    block = load_block_fixture('pivx_mainnet_10000.json')
-    db = make_sapling_db()
-    db.db_height = block['height']
-    session = make_session(db, FixtureDaemon([block]))
+def test_sapling_get_nullifiers_method_is_removed():
+    session = make_session(make_sapling_db(), FixtureDaemon([]))
     session.set_request_handlers((1, 4))
 
-    best_anchor = run(session.handle_request(
-        Request('blockchain.sapling.get_best_anchor', [])))
-    nullifier_status = run(session.handle_request(Request(
-        'blockchain.sapling.get_nullifier_status', ['00' * 32])))
-    commitment_info = run(session.handle_request(Request(
-        'blockchain.sapling.get_commitment_info', ['00' * 32])))
+    assert not hasattr(PIVXSaplingElectrumX, 'sapling_get_nullifiers')
+    assert 'blockchain.sapling.get_nullifiers' not in session.request_handlers
 
+    response = run(session.handle_request(
+        Request('blockchain.sapling.get_nullifiers', [100, 200])))
+
+    assert response['success'] is False
+    assert response['error']['type'] == 'unsupported_method'
+    assert response['method'] == 'blockchain.sapling.get_nullifiers'
+
+
+# ---------------------------------------------------------------------------
+# Session: version negotiation
+# ---------------------------------------------------------------------------
+
+def test_sapling_methods_are_allowed_before_server_version():
+    session = make_session(make_sapling_db(), FixtureDaemon([]))
+    session.set_request_handlers((1, 4))
+    assert session.sv_seen is False
+
+    response = run(session.handle_request(
+        Request('blockchain.sapling.capabilities', [])))
+
+    assert response['version'] == 1
+    # Harmless server info probes are whitelisted too
+    for method in ('server.features', 'server.ping', 'server.banner',
+                   'get_capabilities', 'get_block_range'):
+        assert session.pre_version_method_allowed(method) is True
+    assert session.pre_version_method_allowed(
+        'blockchain.headers.subscribe') is False
+
+
+def test_non_sapling_method_before_server_version_disconnects():
+    session = make_session(make_sapling_db(), FixtureDaemon([]))
+    session.set_request_handlers((1, 4))
+    crash_attempts = []
+
+    async def fake_crash():
+        crash_attempts.append(True)
+
+    session._do_crash_old_electrum_client = fake_crash
+
+    with pytest.raises(ReplyAndDisconnect):
+        run(session.handle_request(
+            Request('blockchain.headers.subscribe', [])))
+    assert crash_attempts == [True]
+
+
+# ---------------------------------------------------------------------------
+# Session: index readiness
+# ---------------------------------------------------------------------------
+
+def test_sapling_index_status_tolerates_daemon_lag_up_to_two_blocks():
+    db = make_sapling_db()
+    db.db_height = Pivx.SAPLING_START_HEIGHT + 100
+
+    tolerant = make_session(
+        db, LaggingDaemon([], cached_height=db.db_height + 2))
+    status = tolerant._sapling_index_status()
+    assert status['ready'] is True
+    assert status['state'] == 'ready'
+    assert status['lag'] == 2
+
+    behind = make_session(
+        db, LaggingDaemon([], cached_height=db.db_height + 3))
+    status = behind._sapling_index_status()
+    assert status['ready'] is False
+    assert status['state'] == 'index_not_ready'
+    assert status['lag'] == 3
+
+
+def test_sapling_capabilities_downgrade_when_index_is_behind_tip(
+        monkeypatch, tmp_path):
+    helper = tmp_path / 'pivx_sapling_witness'
+    helper.write_text('#!/bin/sh\nexit 1\n')
+    helper.chmod(0o755)
+    monkeypatch.setenv(PIVX_SAPLING_WITNESS_HELPER_ENV, str(helper))
+    db = make_sapling_db()
+    db.db_height = 100
+    session = make_session(db, LaggingDaemon([], cached_height=105))
+
+    response = run(session.sapling_capabilities())
+
+    assert response['success'] is False
+    assert response['contract'] is None
+    assert response['release_contract_ready'] is False
+    assert response['features']['canonical_witnesses'] is True
+    assert response['index_status'] == {
+        'ready': False,
+        'state': 'index_not_ready',
+        'db_height': 100,
+        'daemon_height': 105,
+        'lag': 5,
+        'sapling_output_count': 0,
+        'retryable': True,
+    }
+
+
+def test_live_helper_methods_fail_fast_when_index_is_behind_tip():
+    db = make_sapling_db()
+    db.db_height = 10
+    session = make_session(db, LaggingDaemon([], cached_height=13))
+
+    commitment_info = run(session.commitment_get_info(display(asym32(1))))
+    nullifier_status = run(
+        session.sapling_get_nullifier_status(display(asym32(2))))
+    best_anchor = run(session.sapling_get_best_anchor())
+
+    assert commitment_info['success'] is False
+    assert commitment_info['error']['type'] == 'index_not_ready'
+    assert nullifier_status['success'] is False
+    assert nullifier_status['error']['type'] == 'index_not_ready'
     assert best_anchor['available'] is False
-    assert best_anchor['anchor'] is None
-    assert best_anchor['block_hash'] == block['hash']
-    assert nullifier_status['spent'] is False
-    assert commitment_info['exists'] is False
+    assert best_anchor['error']['type'] == 'index_not_ready'
+
+
+# ---------------------------------------------------------------------------
+# Session: get_block_range
+# ---------------------------------------------------------------------------
+
+def test_client_can_rescan_full_pivx_rollback_boundary_with_hashes():
+    block = load_block_fixture('pivx_mainnet_2703076.json')
+    db = make_sapling_db([block])
+    index_block_sapling(db, block)
+    session = make_session(db, FixtureDaemon([block]))
+
+    response = run(session.sapling_get_block_range(
+        block['height'], block['height']))
+
+    assert response['success'] is True
+    assert response['complete'] is True
+    assert response['empty'] is False
+    assert response['height_count'] == 1
+    assert response['block_hashes'] == [
+        {'height': block['height'], 'block_hash': block['hash']}
+    ]
+    stale_local_hashes = {block['height']: 'ff' * 32}
+    mismatches = [
+        item['height']
+        for item in response['block_hashes']
+        if stale_local_hashes[item['height']] != item['block_hash']
+    ]
+    assert mismatches == [block['height']]
 
 
 def test_get_block_range_success_empty_scanned_range_is_complete():
     block = load_block_fixture('pivx_mainnet_10000.json')
-    db = make_sapling_db()
+    db = make_sapling_db([block])
     session = make_session(db, FixtureDaemon([block]))
 
     response = run(session.sapling_get_block_range(
@@ -611,285 +1166,9 @@ def test_get_block_range_success_empty_scanned_range_is_complete():
     assert response['error'] is None
 
 
-class FailingDaemon:
-
-    async def block_hex_hashes(self, start_height, count):
-        raise DaemonError('daemon unavailable')
-
-
-def test_get_block_range_daemon_failure_is_not_complete():
-    db = make_sapling_db()
-    session = make_session(db, FailingDaemon())
-
-    response = run(session.sapling_get_block_range(10, 12))
-
-    assert response['success'] is False
-    assert response['complete'] is False
-    assert response['empty'] is False
-    assert response['height_count'] == 3
-    assert response['block_hashes'] == []
-    assert response['blocks'] == []
-    assert response['error']['type'] == 'daemon_error'
-
-
-def test_get_block_range_invalid_range_is_structured():
-    db = make_sapling_db()
-    session = make_session(db, FixtureDaemon([]))
-
-    response = run(session.sapling_get_block_range(20, 19))
-
-    assert response['success'] is False
-    assert response['complete'] is False
-    assert response['empty'] is False
-    assert response['height_count'] == 0
-    assert response['error']['type'] == 'invalid_range'
-
-
-class LaggingDaemon(FixtureDaemon):
-
-    def __init__(self, blocks, cached_height):
-        super().__init__(blocks)
-        self._cached_height = cached_height
-
-    def cached_height(self):
-        return self._cached_height
-
-
-def test_sapling_capabilities_downgrade_when_index_is_behind_tip(monkeypatch):
-    helper = build_witness_helper()
-    monkeypatch.setenv(PIVX_SAPLING_WITNESS_HELPER_ENV, str(helper))
-    db = make_sapling_db()
-    db.db_height = 100
-    session = make_session(db, LaggingDaemon([], cached_height=105))
-
-    response = run(session.sapling_capabilities())
-
-    assert response['success'] is False
-    assert response['contract'] is None
-    assert response['release_contract_ready'] is False
-    assert response['features']['canonical_witnesses'] is True
-    assert response['index_status'] == {
-        'ready': False,
-        'state': 'index_not_ready',
-        'db_height': 100,
-        'daemon_height': 105,
-        'lag': 5,
-        'sapling_output_count': 0,
-        'retryable': True,
-    }
-
-
-def test_get_block_range_fails_fast_when_index_is_behind_tip():
-    block = load_block_fixture('pivx_mainnet_10000.json')
-    db = make_sapling_db()
-    db.db_height = block['height'] - 1
-    session = make_session(
-        db,
-        LaggingDaemon([block], cached_height=block['height']),
-    )
-
-    response = run(session.sapling_get_block_range(
-        block['height'], block['height']))
-
-    assert response['success'] is False
-    assert response['complete'] is False
-    assert response['empty'] is False
-    assert response['block_count'] == 0
-    assert response['error']['type'] == 'index_not_ready'
-    assert response['error']['retryable'] is True
-    assert response['error']['db_height'] == block['height'] - 1
-    assert response['error']['daemon_height'] == block['height']
-
-
-def test_live_helper_methods_fail_fast_when_index_is_behind_tip():
-    db = make_sapling_db()
-    db.db_height = 10
-    session = make_session(db, LaggingDaemon([], cached_height=12))
-
-    commitment_info = run(session.commitment_get_info('00' * 32))
-    nullifier_status = run(session.sapling_get_nullifier_status('00' * 32))
-    best_anchor = run(session.sapling_get_best_anchor())
-
-    assert commitment_info['success'] is False
-    assert commitment_info['error']['type'] == 'index_not_ready'
-    assert nullifier_status['success'] is False
-    assert nullifier_status['error']['type'] == 'index_not_ready'
-    assert best_anchor['available'] is False
-    assert best_anchor['error']['type'] == 'index_not_ready'
-
-
-class SlowHashDaemon:
-
-    def cached_height(self):
-        return 20
-
-    async def block_hex_hashes(self, start_height, count):
-        await asyncio.sleep(0.2)
-        return ['11' * 32] * count
-
-
-def test_get_block_range_core_rpc_timeout_is_structured(monkeypatch):
-    monkeypatch.setenv('PIVX_SAPLING_RPC_TIMEOUT', '0.05')
-    db = make_sapling_db()
-    db.db_height = 20
-    session = make_session(db, SlowHashDaemon())
-
-    response = run(session.sapling_get_block_range(20, 20))
-
-    assert response['success'] is False
-    assert response['complete'] is False
-    assert response['error']['type'] == 'backend_timeout'
-    assert response['error']['retryable'] is True
-
-
-class PartialHashDaemon:
-
-    async def block_hex_hashes(self, start_height, count):
-        return ['11' * 32]
-
-
-def test_get_block_range_partial_hash_response_is_not_complete():
-    db = make_sapling_db()
-    session = make_session(db, PartialHashDaemon())
-
-    response = run(session.sapling_get_block_range(10, 11))
-
-    assert response['success'] is False
-    assert response['complete'] is False
-    assert response['empty'] is False
-    assert response['height_count'] == 2
-    assert response['block_hashes'] == [
-        {'height': 10, 'block_hash': '11' * 32}
-    ]
-    assert response['blocks'] == []
-    assert response['error']['type'] == 'missing_block_hash'
-    assert response['error']['expected_count'] == 2
-    assert response['error']['actual_count'] == 1
-
-
-class TransientPartialHashDaemon(FixtureDaemon):
-
-    def __init__(self, blocks):
-        super().__init__(blocks)
-        self.hash_calls = 0
-
-    async def block_hex_hashes(self, start_height, count):
-        self.hash_calls += 1
-        if self.hash_calls == 1:
-            return []
-        return await super().block_hex_hashes(start_height, count)
-
-
-def test_get_block_range_recovers_from_transient_short_hash_range():
-    block = load_block_fixture('pivx_mainnet_10000.json')
-    db = make_sapling_db()
-    daemon = TransientPartialHashDaemon([block])
-    session = make_session(db, daemon)
-
-    response = run(session.sapling_get_block_range(
-        block['height'], block['height']))
-
-    assert response['success'] is True
-    assert response['complete'] is True
-    assert response['empty'] is True
-    assert response['block_count'] == 1
-    assert response['blocks'][0]['height'] == block['height']
-    assert response['blocks'][0]['txs'] == []
-    assert daemon.hash_calls == 2
-
-
-class TransientPartialRawBlockDaemon(FixtureDaemon):
-
-    def __init__(self, blocks):
-        super().__init__(blocks)
-        self.raw_calls = 0
-
-    async def raw_blocks(self, block_hashes):
-        self.raw_calls += 1
-        if self.raw_calls == 1:
-            return []
-        return await super().raw_blocks(block_hashes)
-
-
-def test_get_block_range_recovers_from_transient_short_raw_blocks():
-    block = load_block_fixture('pivx_mainnet_10000.json')
-    db = make_sapling_db()
-    daemon = TransientPartialRawBlockDaemon([block])
-    session = make_session(db, daemon)
-
-    response = run(session.sapling_get_block_range(
-        block['height'], block['height']))
-
-    assert response['success'] is True
-    assert response['complete'] is True
-    assert response['empty'] is True
-    assert response['block_count'] == 1
-    assert response['blocks'][0]['height'] == block['height']
-    assert response['blocks'][0]['txs'] == []
-    assert daemon.raw_calls == 2
-
-
-def test_get_block_range_index_incomplete_is_not_complete():
-    block = load_block_fixture('pivx_mainnet_5057529.json')
-    db = make_sapling_db()
-    session = make_session(db, FixtureDaemon([block]))
-
-    response = run(session.sapling_get_block_range(
-        block['height'], block['height']))
-
-    assert response['success'] is False
-    assert response['complete'] is False
-    assert response['empty'] is False
-    assert response['height_count'] == 1
-    assert response['block_hashes'] == [
-        {'height': block['height'], 'block_hash': block['hash']}
-    ]
-    assert response['blocks'] == []
-    assert response['error']['type'] == 'index_incomplete'
-    assert response['error']['height'] == block['height']
-    assert 'commitment' in response['error']
-
-
-def test_empty_blocks_do_not_consume_sapling_positions():
-    db = make_sapling_db()
-    first = b'f' * 32
-    second = b'g' * 32
-
-    db.flush_sapling_data(db.utxo_db, [], [(first, b'a' * 32, 0, 200)], [])
-    db.flush_sapling_data(db.utxo_db, [], [], [])
-    db.flush_sapling_data(db.utxo_db, [], [(second, b'b' * 32, 0, 202)], [])
-
-    assert db.get_commitment_position_info(first)[3] == 0
-    assert db.get_commitment_position_info(second)[3] == 1
-    assert db.sapling_output_count == 2
-
-
-def test_sapling_positions_remain_stable_across_restart():
-    db = make_sapling_db()
-    commitments = [bytes([n]) * 32 for n in range(3)]
-    db.db_height = 101
-    db.flush_sapling_data(
-        db.utxo_db,
-        [],
-        [(commitments[0], b'a' * 32, 0, 100),
-         (commitments[1], b'b' * 32, 1, 100),
-         (commitments[2], b'c' * 32, 0, 101)],
-        [],
-    )
-    db.write_utxo_state(db.utxo_db)
-
-    restarted = make_sapling_db()
-    restarted.utxo_db = db.utxo_db
-    restarted.read_utxo_state()
-
-    assert restarted.sapling_output_count == 3
-    assert [restarted.get_commitment_position_info(c)[3]
-            for c in commitments] == [0, 1, 2]
-
-
 def test_get_block_range_returns_canonical_output_order_with_positions():
     block = load_block_fixture('pivx_mainnet_5057529.json')
-    db = make_sapling_db()
+    db = make_sapling_db([block])
     index_block_sapling(db, block)
     session = make_session(db, FixtureDaemon([block]))
 
@@ -906,11 +1185,10 @@ def test_get_block_range_returns_canonical_output_order_with_positions():
                     len(expected_outputs),
                     tx_index,
                     output_index,
-                    output.cmu.hex(),
-                    tx_lib.hash_to_hex_str(tx.txid)
-                    if hasattr(tx_lib, 'hash_to_hex_str')
-                    else tx.txid[::-1].hex(),
+                    display(output.cmu),
+                    hash_to_hex_str(tx.txid),
                 ))
+    assert expected_outputs
     assert [(output['position'], output['global_position'],
              output['output_index'], output['cmu'])
             for output in outputs] == [
@@ -924,221 +1202,874 @@ def test_get_block_range_returns_canonical_output_order_with_positions():
     ]
 
 
-def test_sapling_witness_fails_closed_without_canonical_backend():
-    db = make_sapling_db()
-    db.db_height = 400
-    commitments = [bytes([n]) * 32 for n in range(1, 5)]
-    db.flush_sapling_data(
-        db.utxo_db,
-        [],
-        [(commitment, bytes([40 + n]) * 32, 0, 400)
-         for n, commitment in enumerate(commitments)],
-        [],
-    )
-    root = DB.sapling_root_from_commitments(commitments)
-    session = make_session(db, FixtureDaemon([]))
-
-    try:
-        run(session.sapling_get_witness(2, root.hex()))
-    except RPCError as e:
-        assert 'witness_backend_unavailable' in e.message
-    else:
-        raise AssertionError('non-canonical placeholder witness was returned')
-
-
-def test_sapling_commitment_only_witness_fails_closed_without_backend():
-    db = make_sapling_db()
-    db.db_height = 400
-    commitment = b'c' * 32
-    db.flush_sapling_data(
-        db.utxo_db,
-        [],
-        [(commitment, b't' * 32, 0, 400)],
-        [],
-    )
-    session = make_session(db, FixtureDaemon([]))
-
-    try:
-        run(session.sapling_get_witness(commitment.hex()))
-    except RPCError as e:
-        assert 'witness_backend_unavailable' in e.message
-    else:
-        raise AssertionError('commitment-only placeholder witness was returned')
-
-
-def test_sapling_best_anchor_and_anchor_bound_witness_use_canonical_backend(
-        monkeypatch):
-    helper = build_witness_helper()
-    monkeypatch.setenv(PIVX_SAPLING_WITNESS_HELPER_ENV, str(helper))
-    block = load_block_fixture('pivx_mainnet_10000.json')
-    db = make_sapling_db()
-    db.db_height = block['height']
-    commitments = [canonical_cmu(n) for n in range(1, 5)]
-    db.flush_sapling_data(
-        db.utxo_db,
-        [],
-        [(commitment, bytes([80 + n]) * 32, n, 400 + n)
-         for n, commitment in enumerate(commitments)],
-        [],
-    )
+def test_get_block_range_serves_display_byte_order():
+    block = load_block_fixture('pivx_mainnet_5057529.json')
+    db = make_sapling_db([block])
+    index_block_sapling(db, block)
     session = make_session(db, FixtureDaemon([block]))
 
-    best_anchor = run(session.sapling_get_best_anchor())
-    witness = run(session.sapling_get_witness(
-        commitments[2].hex(), best_anchor['anchor']))
+    response = run(session.sapling_get_block_range(
+        block['height'], block['height']))
 
-    # The anchor height is the height of the last leaf in the selected tree,
-    # not the chain tip, so best-anchor and witness responses stay consistent
-    # across later blocks without Sapling activity.
-    assert best_anchor['available'] is True
-    assert best_anchor['anchor'] == witness['anchor']
-    assert best_anchor['root'] == witness['root']
-    assert best_anchor['anchor_height'] == 403
-    assert best_anchor['block_hash'] == block['hash']
-    assert best_anchor['tree_size'] == 4
-    assert witness['commitment'] == commitments[2].hex()
-    assert witness['cmu'] == commitments[2].hex()
-    assert witness['position'] == 2
-    assert witness['global_position'] == 2
-    assert witness['height'] == 402
-    assert witness['anchor_height'] == 403
-    assert witness['tree_size'] == 4
-    assert witness['path_length'] == 32
-    assert len(witness['path']) == 32
-    assert all(isinstance(item, str) and len(item) == 64
-               for item in witness['path'])
-    verify_witness_with_helper(witness)
+    assert response['success'] is True
+    sapling_tx = next(tx for tx in parse_block_txs(block)
+                      if isinstance(tx, tx_lib.TxPIVXSapling))
+    compact_tx = response['blocks'][0]['txs'][0]
+
+    output = sapling_tx.sapling_outputs[0]
+    output_data = compact_tx['outputs'][0]
+    assert output_data['cmu'] == display(output.cmu)
+    assert output_data['cmu'] != output.cmu.hex()  # reversal must happen
+    assert output_data['epk'] == display(output.ephemeral_key)
+    assert output_data['ephemeral_key'] == output_data['epk']
+    assert output_data['cv'] == display(output.cv)
+    # Ciphertexts are natural-order byte vectors, not uint256 values
+    assert output_data['enc_ciphertext'] == output.enc_ciphertext.hex()
+    assert output_data['out_ciphertext'] == output.out_ciphertext.hex()
+
+    spend = sapling_tx.sapling_spends[0]
+    spend_data = compact_tx['spends'][0]
+    assert spend_data['nullifier'] == display(spend.nullifier)
+    assert spend_data['nullifier'] != spend.nullifier.hex()
+    assert spend_data['anchor'] == display(spend.anchor)
+    assert spend_data['cv'] == display(spend.cv)
+    assert spend_data['rk'] == display(spend.rk)
 
 
-def test_sapling_best_anchor_is_stable_across_blocks_without_outputs(
-        monkeypatch):
-    helper = build_witness_helper()
-    monkeypatch.setenv(PIVX_SAPLING_WITNESS_HELPER_ENV, str(helper))
-    block = load_block_fixture('pivx_mainnet_10000.json')
+def test_get_block_range_invalid_range_is_structured():
     db = make_sapling_db()
-    db.db_height = block['height']
-    commitments = [canonical_cmu(n) for n in range(1, 4)]
-    db.flush_sapling_data(
-        db.utxo_db,
-        [],
-        [(commitment, bytes([70 + n]) * 32, n, 300 + n)
-         for n, commitment in enumerate(commitments)],
-        [],
-    )
-    later_block = {'height': block['height'] + 5, 'hash': '22' * 32}
-    session = make_session(db, FixtureDaemon([block, later_block]))
-
-    first = run(session.sapling_get_best_anchor())
-    # New blocks without Sapling outputs must not change or recompute the
-    # canonical anchor, and a witness bound to the earlier anchor must still
-    # report the same anchor height after the tip moves.
-    db.db_height = block['height'] + 5
-    second = run(session.sapling_get_best_anchor())
-    witness = run(session.sapling_get_witness(
-        commitments[0].hex(), first['anchor']))
-
-    assert first['available'] is True
-    assert second['available'] is True
-    assert second['anchor'] == first['anchor']
-    assert second['anchor_height'] == first['anchor_height'] == 302
-    assert witness['anchor'] == first['anchor']
-    assert witness['anchor_height'] == first['anchor_height']
-    verify_witness_with_helper(witness)
-
-
-def test_sapling_witness_state_cache_returns_identical_results(
-        monkeypatch, tmp_path):
-    helper = build_witness_helper()
-    monkeypatch.setenv(PIVX_SAPLING_WITNESS_HELPER_ENV, str(helper))
-    state_file = tmp_path / 'witness_state.bin'
-    monkeypatch.setenv(
-        'PIVX_SAPLING_WITNESS_STATE_FILE', str(state_file))
-    db = make_sapling_db()
-    db.db_height = 600
-    commitments = [canonical_cmu(n) for n in range(1, 6)]
-    db.flush_sapling_data(
-        db.utxo_db,
-        [],
-        [(commitment, bytes([40 + n]) * 32, n, 550 + n)
-         for n, commitment in enumerate(commitments)],
-        [],
-    )
     session = make_session(db, FixtureDaemon([]))
 
-    cold = run(session.sapling_get_witness(commitments[3].hex()))
-    assert state_file.exists()
-    warm = run(session.sapling_get_witness(commitments[3].hex()))
-    anchor_bound = run(session.sapling_get_witness(
-        commitments[3].hex(), warm['anchor']))
+    response = run(session.sapling_get_block_range(20, 19))
 
-    assert warm == cold
-    assert anchor_bound['path'] == cold['path']
-    assert anchor_bound['anchor'] == cold['anchor']
-    assert anchor_bound['anchor_height'] == cold['anchor_height'] == 554
-    verify_witness_with_helper(warm)
+    assert response['success'] is False
+    assert response['complete'] is False
+    assert response['empty'] is False
+    assert response['height_count'] == 0
+    assert response['error']['type'] == 'invalid_range'
 
 
-def test_sapling_witness_supports_historical_anchor(monkeypatch):
-    helper = build_witness_helper()
-    monkeypatch.setenv(PIVX_SAPLING_WITNESS_HELPER_ENV, str(helper))
-    block = load_block_fixture('pivx_mainnet_10000.json')
+def test_get_block_range_too_large_is_structured():
     db = make_sapling_db()
-    db.db_height = block['height']
-    early = [canonical_cmu(n) for n in range(1, 4)]
-    db.flush_sapling_data(
-        db.utxo_db,
-        [],
-        [(commitment, bytes([60 + n]) * 32, n, 200 + n)
-         for n, commitment in enumerate(early)],
-        [],
-    )
+    db.db_height = 10_000
+    session = make_session(db, FixtureDaemon([]))
+
+    response = run(session.sapling_get_block_range(
+        0, PIVX_SAPLING_MAX_BLOCK_RANGE))
+
+    assert response['success'] is False
+    assert response['error']['type'] == 'invalid_range'
+    assert response['error']['max_block_range'] == (
+        PIVX_SAPLING_MAX_BLOCK_RANGE)
+
+
+def test_get_block_range_above_indexed_tip_is_index_incomplete():
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db([block])
+    db.db_height = block['height'] - 1
     session = make_session(db, FixtureDaemon([block]))
-    historical_anchor = run(session.sapling_get_best_anchor())
 
-    # New outputs after the anchor was selected: the witness must be computed
-    # against the historical tree state bound to the requested anchor, not the
-    # grown current tree.
-    late = [canonical_cmu(n) for n in range(10, 13)]
+    response = run(session.sapling_get_block_range(
+        block['height'], block['height']))
+
+    assert response['success'] is False
+    assert response['complete'] is False
+    assert response['blocks'] == []
+    assert response['error']['type'] == 'index_incomplete'
+    assert response['error']['indexed_height'] == block['height'] - 1
+
+
+def test_get_block_range_fails_fast_when_index_is_behind_tip():
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db([block])
+    db.db_height = block['height'] - 3
+    session = make_session(
+        db,
+        LaggingDaemon([block], cached_height=block['height']),
+    )
+
+    response = run(session.sapling_get_block_range(
+        block['height'], block['height']))
+
+    assert response['success'] is False
+    assert response['complete'] is False
+    assert response['empty'] is False
+    assert response['block_count'] == 0
+    assert response['error']['type'] == 'index_not_ready'
+    assert response['error']['retryable'] is True
+    assert response['error']['db_height'] == block['height'] - 3
+    assert response['error']['daemon_height'] == block['height']
+
+
+class FailingRawBlocksDaemon:
+
+    async def raw_blocks(self, block_hashes):
+        raise DaemonError('daemon unavailable')
+
+
+def test_get_block_range_daemon_failure_is_not_complete():
+    blocks = [{'height': height, 'hash': format(height, '064x')}
+              for height in (10, 11, 12)]
+    db = make_sapling_db(blocks)
+    session = make_session(db, FailingRawBlocksDaemon())
+
+    response = run(session.sapling_get_block_range(10, 12))
+
+    assert response['success'] is False
+    assert response['complete'] is False
+    assert response['empty'] is False
+    assert response['height_count'] == 3
+    # Hashes come from our own index and are reported even on failure
+    assert [item['height'] for item in response['block_hashes']] == [10, 11, 12]
+    assert response['blocks'] == []
+    assert response['error']['type'] == 'daemon_error'
+
+
+class SlowRawBlocksDaemon:
+
+    def cached_height(self):
+        return 20
+
+    async def raw_blocks(self, block_hashes):
+        await asyncio.sleep(0.2)
+        return []
+
+
+def test_get_block_range_core_rpc_timeout_is_structured(monkeypatch):
+    monkeypatch.setenv('PIVX_SAPLING_RPC_TIMEOUT', '0.05')
+    db = make_sapling_db([{'height': 20, 'hash': '11' * 32}])
+    session = make_session(db, SlowRawBlocksDaemon())
+
+    response = run(session.sapling_get_block_range(20, 20))
+
+    assert response['success'] is False
+    assert response['complete'] is False
+    assert response['error']['type'] == 'backend_timeout'
+    assert response['error']['retryable'] is True
+
+
+class ShortRawBlocksDaemon:
+
+    def __init__(self):
+        self.raw_calls = 0
+
+    async def raw_blocks(self, block_hashes):
+        self.raw_calls += 1
+        return []
+
+
+def test_get_block_range_persistent_short_raw_blocks_is_missing_block():
+    blocks = [{'height': height, 'hash': format(height, '064x')}
+              for height in (10, 11)]
+    db = make_sapling_db(blocks)
+    daemon = ShortRawBlocksDaemon()
+    session = make_session(db, daemon)
+
+    response = run(session.sapling_get_block_range(10, 11))
+
+    assert response['success'] is False
+    assert response['complete'] is False
+    assert response['error']['type'] == 'missing_block'
+    assert response['error']['expected_count'] == 2
+    assert response['error']['actual_count'] == 0
+    assert daemon.raw_calls == 2  # one retry, then fail closed
+
+
+class TransientShortRawBlocksDaemon(FixtureDaemon):
+
+    def __init__(self, blocks):
+        super().__init__(blocks)
+        self.raw_calls = 0
+
+    async def raw_blocks(self, block_hashes):
+        self.raw_calls += 1
+        if self.raw_calls == 1:
+            return []
+        return await super().raw_blocks(block_hashes)
+
+
+def test_get_block_range_recovers_from_transient_short_raw_blocks():
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db([block])
+    daemon = TransientShortRawBlocksDaemon([block])
+    session = make_session(db, daemon)
+
+    response = run(session.sapling_get_block_range(
+        block['height'], block['height']))
+
+    assert response['success'] is True
+    assert response['complete'] is True
+    assert response['empty'] is True
+    assert response['block_count'] == 1
+    assert response['blocks'][0]['height'] == block['height']
+    assert response['blocks'][0]['txs'] == []
+    assert daemon.raw_calls == 2
+
+
+def test_get_block_range_index_incomplete_is_not_complete():
+    block = load_block_fixture('pivx_mainnet_5057529.json')
+    db = make_sapling_db([block])  # commitments deliberately not indexed
+    session = make_session(db, FixtureDaemon([block]))
+
+    response = run(session.sapling_get_block_range(
+        block['height'], block['height']))
+
+    assert response['success'] is False
+    assert response['complete'] is False
+    assert response['empty'] is False
+    assert response['height_count'] == 1
+    assert response['block_hashes'] == [
+        {'height': block['height'], 'block_hash': block['hash']}
+    ]
+    assert response['blocks'] == []
+    assert response['error']['type'] == 'index_incomplete'
+    assert response['error']['height'] == block['height']
+    assert 'commitment' in response['error']
+    # The offending commitment is reported in display byte order
+    sapling_tx = next(tx for tx in parse_block_txs(block)
+                      if isinstance(tx, tx_lib.TxPIVXSapling))
+    assert response['error']['commitment'] == display(
+        sapling_tx.sapling_outputs[0].cmu)
+
+
+# ---------------------------------------------------------------------------
+# Session: get_outputs
+# ---------------------------------------------------------------------------
+
+def test_get_outputs_serves_display_order_from_indexed_hashes():
+    block = load_block_fixture('pivx_mainnet_2703076.json')
+    db = make_sapling_db([block])
+    session = make_session(db, FixtureDaemon([block]))
+
+    response = run(session.sapling_get_outputs(
+        block['height'], block['height']))
+
+    sapling_tx = next(tx for tx in parse_block_txs(block)
+                      if isinstance(tx, tx_lib.TxPIVXSapling))
+    output = sapling_tx.sapling_outputs[0]
+    assert response['count'] == 1
+    assert response['more'] is False
+    assert response['outputs'] == [{
+        'txid': hash_to_hex_str(sapling_tx.txid),
+        'index': 0,
+        'height': block['height'],
+        'cmu': display(output.cmu),
+        'epk': display(output.ephemeral_key),
+        'enc_ciphertext': output.enc_ciphertext.hex(),
+    }]
+
+
+def test_get_outputs_fails_on_short_daemon_block_response():
+    block = load_block_fixture('pivx_mainnet_2703076.json')
+    db = make_sapling_db([block])
+
+    class ShortDaemon(FixtureDaemon):
+        # Daemon returns fewer blocks than requested
+        async def raw_blocks(self, block_hashes):
+            return []
+
+    session = make_session(db, ShortDaemon([block]))
+
+    with pytest.raises(RPCError, match='of 1 requested blocks'):
+        run(session.sapling_get_outputs(block['height'], block['height']))
+
+
+def test_get_outputs_rejects_range_above_indexed_tip():
+    block = load_block_fixture('pivx_mainnet_2703076.json')
+    db = make_sapling_db([block])
+    session = make_session(db, FixtureDaemon([block]))
+
+    with pytest.raises(RPCError, match='above indexed tip'):
+        run(session.sapling_get_outputs(
+            block['height'], block['height'] + 1))
+
+
+def test_get_outputs_caps_range_at_max_block_range():
+    db = make_sapling_db()
+    db.db_height = 10_000
+    session = make_session(db, FixtureDaemon([]))
+
+    with pytest.raises(RPCError, match='range too large'):
+        run(session.sapling_get_outputs(0, PIVX_SAPLING_MAX_BLOCK_RANGE))
+
+
+# ---------------------------------------------------------------------------
+# Session: get_tree_state
+# ---------------------------------------------------------------------------
+
+def test_get_tree_state_serves_consensus_header_root():
+    block = load_block_fixture('pivx_mainnet_2703076.json')
+    db = make_sapling_db([block])
+    index_block_sapling(db, block)
+    session = make_session(db, FixtureDaemon([block]))
+    root = block['raw'][80:112]
+
+    response = run(session.sapling_get_tree_state(block['height']))
+
+    assert response == {
+        'success': True,
+        'contract': PIVX_SAPLING_RPC_CONTRACT,
+        'height': block['height'],
+        'block_hash': block['hash'],
+        'anchor': display(root),
+        'root': display(root),
+        'latest_anchor': display(root),
+        'anchor_first_height': block['height'],
+        'tree_size': 1,
+        'commitment_count': 1,
+        'indexed_height': block['height'],
+        'sapling_activation_height': Pivx.SAPLING_START_HEIGHT,
+    }
+    # Defaults to the indexed tip
+    assert run(session.sapling_get_tree_state()) == response
+
+
+def test_get_tree_state_above_tip_is_index_incomplete():
+    block = load_block_fixture('pivx_mainnet_2703076.json')
+    db = make_sapling_db([block])
+    session = make_session(db, FixtureDaemon([block]))
+
+    response = run(session.sapling_get_tree_state(block['height'] + 1))
+
+    assert response['success'] is False
+    assert response['error']['type'] == 'index_incomplete'
+    assert response['error']['indexed_height'] == block['height']
+
+
+def test_get_tree_state_below_activation_is_invalid_range():
+    block = load_block_fixture('pivx_mainnet_2703076.json')
+    db = make_sapling_db([block])
+    session = make_session(db, FixtureDaemon([block]))
+
+    response = run(session.sapling_get_tree_state(
+        Pivx.SAPLING_START_HEIGHT - 1))
+
+    assert response['success'] is False
+    assert response['error']['type'] == 'invalid_range'
+    assert response['error']['sapling_activation_height'] == (
+        Pivx.SAPLING_START_HEIGHT)
+
+
+def test_get_tree_state_missing_header_root_is_index_error():
+    block = load_block_fixture('pivx_mainnet_2703076.json')
+    db = make_sapling_db([block])
+    db.db_height = block['height'] + 1  # no header stored for this height
+    session = make_session(db, FixtureDaemon([block]))
+
+    response = run(session.sapling_get_tree_state(block['height'] + 1))
+
+    assert response['success'] is False
+    assert response['error']['type'] == 'index_error'
+
+
+def test_get_tree_state_unindexed_root_is_index_incomplete():
+    block = load_block_fixture('pivx_mainnet_2703076.json')
+    db = make_sapling_db([block])
+    # Commitments indexed but the header root was never anchored
+    for tx in parse_block_txs(block):
+        if isinstance(tx, tx_lib.TxPIVXSapling):
+            db.flush_sapling_data(
+                db.utxo_db, [],
+                [(output.cmu, tx.txid, n, block['height'], n)
+                 for n, output in enumerate(tx.sapling_outputs)],
+                [])
+            db.sapling_output_count = len(tx.sapling_outputs)
+    session = make_session(db, FixtureDaemon([block]))
+
+    response = run(session.sapling_get_tree_state(block['height']))
+
+    assert response['success'] is False
+    assert response['error']['type'] == 'index_incomplete'
+
+
+# ---------------------------------------------------------------------------
+# Session: nullifier / commitment / anchor lookups (display byte order)
+# ---------------------------------------------------------------------------
+
+def test_nullifier_status_uses_display_byte_order():
+    db = make_sapling_db()
+    nf_raw = asym32(0x81)
+    tx_hash = asym32(0x82)
+    db.flush_sapling_data(db.utxo_db, [(nf_raw, tx_hash, 250, 1)], [], [])
+    session = make_session(db, FixtureDaemon([]))
+
+    spent = run(session.sapling_get_nullifier_status(display(nf_raw)))
+    assert spent == {
+        'spent': True,
+        'tx_hash': hash_to_hex_str(tx_hash),
+        'txid': hash_to_hex_str(tx_hash),
+        'height': 250,
+        'spend_index': 1,
+    }
+
+    # Raw-order input must not match: the boundary reverses exactly once
+    raw_order = run(session.sapling_get_nullifier_status(nf_raw.hex()))
+    assert raw_order['spent'] is False
+
+
+def test_unknown_nullifier_status_returns_structured_unspent_response():
+    db = make_sapling_db()
+    session = make_session(db, FixtureDaemon([]))
+
+    response = run(session.sapling_get_nullifier_status(display(asym32(9))))
+
+    assert response == {
+        'spent': False,
+        'tx_hash': None,
+        'txid': None,
+        'height': None,
+        'spend_index': None,
+    }
+
+
+def test_check_nullifiers_wraps_statuses_in_envelope():
+    db = make_sapling_db()
+    nf_raw = asym32(0x83)
+    db.flush_sapling_data(db.utxo_db, [(nf_raw, asym32(0x84), 251, 0)],
+                          [], [])
+    session = make_session(db, FixtureDaemon([]))
+    spent_hex = display(nf_raw)
+    unspent_hex = display(asym32(0x85))
+
+    response = run(session.sapling_check_nullifiers(
+        [spent_hex, unspent_hex]))
+
+    assert response['success'] is True
+    assert response['contract'] == PIVX_SAPLING_RPC_CONTRACT
+    assert response['results'][spent_hex]['spent'] is True
+    assert response['results'][unspent_hex]['spent'] is False
+
+
+def test_commitment_info_uses_display_byte_order():
+    db = make_sapling_db()
+    cm_raw = asym32(0x86)
+    tx_hash = asym32(0x87)
+    db.flush_sapling_data(db.utxo_db, [],
+                          [(cm_raw, tx_hash, 3, 260, 12)], [])
+    session = make_session(db, FixtureDaemon([]))
+
+    response = run(session.commitment_get_info(display(cm_raw)))
+    assert response == {
+        'exists': True,
+        'txid': hash_to_hex_str(tx_hash),
+        'output_index': 3,
+        'height': 260,
+        'position': 12,
+    }
+
+    raw_order = run(session.commitment_get_info(cm_raw.hex()))
+    assert raw_order['exists'] is False
+
+
+def test_unknown_commitment_info_returns_structured_absent_response():
+    db = make_sapling_db()
+    session = make_session(db, FixtureDaemon([]))
+
+    response = run(session.commitment_get_info(display(asym32(8))))
+
+    assert response == {
+        'exists': False,
+        'txid': None,
+        'output_index': None,
+        'height': None,
+        'position': None,
+    }
+
+
+def test_anchor_get_height_uses_display_byte_order():
+    db = make_sapling_db()
+    root = asym32(0x88)
+    db.flush_sapling_data(db.utxo_db, [], [], [(root, 123, 9)])
+    session = make_session(db, FixtureDaemon([]))
+
+    assert run(session.anchor_get_height(display(root))) == 123
+    assert run(session.anchor_get_height(root.hex())) is None
+
+
+# ---------------------------------------------------------------------------
+# Session: witnesses and best anchor (canonical helper + consensus anchors)
+# ---------------------------------------------------------------------------
+
+def seed_witness_db(db, count=4, height_base=401):
+    '''Index ``count`` commitments at positions 0..count-1.'''
+    cmus = [asym32(0x10, n) for n in range(count)]
+    tx_hashes = [asym32(0x90, n) for n in range(count)]
     db.flush_sapling_data(
         db.utxo_db,
         [],
-        [(commitment, bytes([65 + n]) * 32, n, 210 + n)
-         for n, commitment in enumerate(late)],
+        [(cmu, tx_hashes[n], n, height_base + n, n)
+         for n, cmu in enumerate(cmus)],
         [],
     )
-
-    witness = run(session.sapling_get_witness(
-        early[1].hex(), historical_anchor['anchor']))
-    current = run(session.sapling_get_best_anchor())
-
-    assert current['anchor'] != historical_anchor['anchor']
-    assert witness['anchor'] == historical_anchor['anchor']
-    assert witness['anchor_height'] == historical_anchor['anchor_height'] == 202
-    assert witness['tree_size'] == 3
-    assert witness['position'] == 1
-    verify_witness_with_helper(witness)
+    db.sapling_output_count = count
+    return cmus, tx_hashes
 
 
-def test_sapling_commitment_only_witness_reports_usable_anchor(monkeypatch):
-    helper = build_witness_helper()
-    monkeypatch.setenv(PIVX_SAPLING_WITNESS_HELPER_ENV, str(helper))
+WITNESS_PATH = [(bytes([i]) * 32).hex() for i in range(32)]
+
+
+def test_sapling_commitments_for_witness_is_async_raw_order_and_cached():
+    db = make_sapling_db()
+    cmus, _tx_hashes = seed_witness_db(db)
+    session = make_session(db, FixtureDaemon([]))
+
+    commitments = run(session._sapling_commitments_for_witness())
+
+    assert commitments == [
+        {'cmu': cmu.hex(), 'height': 401 + n}  # raw order for the helper
+        for n, cmu in enumerate(cmus)
+    ]
+    assert run(session._sapling_commitments_for_witness()) is commitments
+
+
+def test_sapling_witness_fails_closed_without_canonical_backend(monkeypatch):
+    monkeypatch.delenv(PIVX_SAPLING_WITNESS_HELPER_ENV, raising=False)
+    monkeypatch.setattr('electrumx.server.session.shutil.which',
+                        lambda _name: None)
     db = make_sapling_db()
     db.db_height = 500
-    commitments = [canonical_cmu(n) for n in range(1, 4)]
-    db.flush_sapling_data(
-        db.utxo_db,
-        [],
-        [(commitment, bytes([90 + n]) * 32, n, 498 + n)
-         for n, commitment in enumerate(commitments)],
-        [],
-    )
+    cmus, _tx_hashes = seed_witness_db(db)
+    root = asym32(0xA8)
+    db.flush_sapling_data(db.utxo_db, [], [], [(root, 404, 4)])
     session = make_session(db, FixtureDaemon([]))
 
-    witness = run(session.sapling_get_witness(commitments[1].hex()))
+    with pytest.raises(RPCError, match='witness_backend_unavailable'):
+        run(session.sapling_get_witness(display(cmus[2]), display(root)))
 
-    assert witness['commitment'] == commitments[1].hex()
-    assert witness['anchor'] == witness['root']
-    assert witness['anchor_height'] == 500
-    assert witness['tree_size'] == 3
-    assert len(witness['path']) == 32
-    verify_witness_with_helper(witness)
+
+def test_sapling_commitment_only_witness_fails_closed_without_backend(
+        monkeypatch):
+    monkeypatch.delenv(PIVX_SAPLING_WITNESS_HELPER_ENV, raising=False)
+    monkeypatch.setattr('electrumx.server.session.shutil.which',
+                        lambda _name: None)
+    db = make_sapling_db()
+    db.db_height = 500
+    cmus, _tx_hashes = seed_witness_db(db, count=1)
+    session = make_session(db, FixtureDaemon([]))
+
+    with pytest.raises(RPCError, match='witness_backend_unavailable'):
+        run(session.sapling_get_witness(display(cmus[0])))
+
+
+def test_sapling_witness_round_trips_display_order_and_validates_anchor():
+    db = make_sapling_db()
+    db.db_height = 500
+    cmus, tx_hashes = seed_witness_db(db)
+    root = asym32(0xA9)
+    db.flush_sapling_data(db.utxo_db, [], [], [(root, 404, 4)])
+    session = make_session(db, FixtureDaemon([]))
+    costs = []
+    session.bump_cost = costs.append
+    calls = install_fake_helper(session, {
+        'success': True,
+        'root': root.hex(),  # helper speaks raw order
+        'anchor_height': 404,
+        'tree_size': 4,
+        'path': WITNESS_PATH,
+    })
+
+    witness = run(session.sapling_get_witness(
+        display(cmus[2]), display(root)))
+
+    # The helper receives raw-order hex for the anchor and commitments
+    assert len(calls) == 1
+    payload = calls[0]
+    assert payload['mode'] == 'witness'
+    assert payload['position'] == 2
+    assert payload['anchor'] == root.hex()
+    assert payload['commitments'] == [
+        {'cmu': cmu.hex(), 'height': 401 + n}
+        for n, cmu in enumerate(cmus)
+    ]
+
+    # The response converts back to display order exactly once
+    assert witness['anchor'] == display(root)
+    assert witness['root'] == display(root)
+    assert witness['cmu'] == display(cmus[2])
+    assert witness['commitment'] == display(cmus[2])
+    assert witness['anchor'] != root.hex()
+    assert witness['position'] == 2
+    assert witness['global_position'] == 2
+    assert witness['height'] == 403
+    assert witness['txid'] == hash_to_hex_str(tx_hashes[2])
+    assert witness['output_index'] == 2
+    assert witness['anchor_height'] == 404
+    assert witness['tree_size'] == 4
+    # Witness path elements remain raw Sapling node encodings
+    assert witness['path'] == WITNESS_PATH
+    assert witness['witness'] == WITNESS_PATH
+    assert witness['path_length'] == 32
+    assert witness['path_order'] == 'leaf_to_root'
+    # Witness cost scales with the indexed output count
+    assert costs[0] == 5.0 + db.sapling_output_count / 500
+
+
+def test_sapling_witness_by_position_without_anchor():
+    db = make_sapling_db()
+    db.db_height = 500
+    cmus, _tx_hashes = seed_witness_db(db)
+    root = asym32(0xAA)
+    db.flush_sapling_data(db.utxo_db, [], [], [(root, 404, 4)])
+    session = make_session(db, FixtureDaemon([]))
+    calls = install_fake_helper(session, {
+        'success': True,
+        'root': root.hex(),
+        'anchor_height': 404,
+        'tree_size': 4,
+        'path': WITNESS_PATH,
+    })
+
+    witness = run(session.sapling_get_witness(1))
+
+    assert calls[0]['position'] == 1
+    assert calls[0]['anchor'] is None
+    assert witness['cmu'] == display(cmus[1])
+    assert witness['anchor'] == display(root)
+
+
+def test_sapling_witness_rejects_non_consensus_requested_anchor():
+    db = make_sapling_db()
+    db.db_height = 500
+    cmus, _tx_hashes = seed_witness_db(db)
+    session = make_session(db, FixtureDaemon([]))
+    calls = install_fake_helper(session, {'success': True})
+
+    with pytest.raises(RPCError, match='index_incomplete'):
+        run(session.sapling_get_witness(
+            display(cmus[0]), display(asym32(0xAB))))
+
+    # Validated against b'A' before paying for the helper call
+    assert calls == []
+
+
+def test_sapling_witness_fails_closed_when_helper_root_not_consensus():
+    db = make_sapling_db()
+    db.db_height = 500
+    cmus, _tx_hashes = seed_witness_db(db)
+    session = make_session(db, FixtureDaemon([]))
+    rogue_root = asym32(0xAC)  # never anchored in b'A'
+    calls = install_fake_helper(session, {
+        'success': True,
+        'root': rogue_root.hex(),
+        'anchor_height': 404,
+        'tree_size': 4,
+        'path': WITNESS_PATH,
+    })
+
+    with pytest.raises(RPCError, match='index_incomplete'):
+        run(session.sapling_get_witness(display(cmus[0])))
+    assert len(calls) == 1
+
+
+def test_sapling_witness_fails_closed_on_tree_size_mismatch():
+    db = make_sapling_db()
+    db.db_height = 500
+    cmus, _tx_hashes = seed_witness_db(db)
+    root = asym32(0xAD)
+    db.flush_sapling_data(db.utxo_db, [], [], [(root, 404, 4)])
+    session = make_session(db, FixtureDaemon([]))
+    install_fake_helper(session, {
+        'success': True,
+        'root': root.hex(),
+        'anchor_height': 404,
+        'tree_size': 3,  # diverges from the consensus anchor's size
+        'path': WITNESS_PATH,
+    })
+
+    with pytest.raises(RPCError, match='tree size'):
+        run(session.sapling_get_witness(display(cmus[0])))
+
+
+def test_sapling_witness_fails_closed_on_missing_tree_size():
+    db = make_sapling_db()
+    db.db_height = 500
+    cmus, _tx_hashes = seed_witness_db(db)
+    root = asym32(0xAD)
+    db.flush_sapling_data(db.utxo_db, [], [], [(root, 404, 4)])
+    session = make_session(db, FixtureDaemon([]))
+    # Helper omits tree_size entirely: must not bypass the size check
+    install_fake_helper(session, {
+        'success': True,
+        'root': root.hex(),
+        'anchor_height': 404,
+        'path': WITNESS_PATH,
+    })
+
+    with pytest.raises(RPCError, match='missing its tree size'):
+        run(session.sapling_get_witness(display(cmus[0])))
+
+
+def test_sapling_witness_detects_anchor_mismatch_from_helper():
+    db = make_sapling_db()
+    db.db_height = 500
+    cmus, _tx_hashes = seed_witness_db(db)
+    requested = asym32(0xAE)
+    db.flush_sapling_data(db.utxo_db, [], [], [(requested, 404, 4)])
+    session = make_session(db, FixtureDaemon([]))
+    install_fake_helper(session, {
+        'success': True,
+        'root': asym32(0xAF).hex(),  # not the requested anchor
+        'anchor_height': 404,
+        'tree_size': 4,
+        'path': WITNESS_PATH,
+    })
+
+    with pytest.raises(RPCError, match='anchor_mismatch'):
+        run(session.sapling_get_witness(
+            display(cmus[0]), display(requested)))
+
+
+def test_sapling_witness_rejects_invalid_helper_path_shape():
+    db = make_sapling_db()
+    db.db_height = 500
+    cmus, _tx_hashes = seed_witness_db(db)
+    session = make_session(db, FixtureDaemon([]))
+    install_fake_helper(session, {
+        'success': True,
+        'root': asym32(0xB0).hex(),
+        'tree_size': 4,
+        'path': WITNESS_PATH[:31],  # must be exactly 32 nodes
+    })
+
+    with pytest.raises(RPCError, match='invalid path shape'):
+        run(session.sapling_get_witness(display(cmus[0])))
+
+
+def test_sapling_get_witnesses_batches_and_caps():
+    db = make_sapling_db()
+    db.db_height = 500
+    cmus, _tx_hashes = seed_witness_db(db)
+    root = asym32(0xB1)
+    db.flush_sapling_data(db.utxo_db, [], [], [(root, 404, 4)])
+    session = make_session(db, FixtureDaemon([]))
+    install_fake_helper(session, {
+        'success': True,
+        'root': root.hex(),
+        'anchor_height': 404,
+        'tree_size': 4,
+        'path': WITNESS_PATH,
+    })
+
+    witnesses = run(session.sapling_get_witnesses([0, 1]))
+    assert [w['position'] for w in witnesses] == [0, 1]
+    assert [w['cmu'] for w in witnesses] == [
+        display(cmus[0]), display(cmus[1])]
+
+    with pytest.raises(RPCError, match='more than 100'):
+        run(session.sapling_get_witnesses(list(range(101))))
+
+
+def test_sapling_best_anchor_serves_validated_display_anchor():
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db([block])
+    cmus, _tx_hashes = seed_witness_db(db)
+    root = asym32(0xB2)
+    db.flush_sapling_data(db.utxo_db, [], [], [(root, 404, 4)])
+    session = make_session(db, FixtureDaemon([block]))
+    calls = install_fake_helper(session, {
+        'success': True,
+        'anchor': root.hex(),  # raw order from the helper
+        'anchor_height': 404,
+        'tree_size': 4,
+    })
+
+    response = run(session.sapling_get_best_anchor())
+
+    assert response['available'] is True
+    assert response['anchor'] == display(root)
+    assert response['root'] == display(root)
+    assert response['anchor'] != root.hex()
+    assert response['anchor_height'] == 404
+    assert response['tree_size'] == 4
+    assert response['height'] == block['height']
+    assert response['block_hash'] == block['hash']
+    assert calls[0]['mode'] == 'root'
+
+    # Cached while the tree is unchanged: no second helper call
+    again = run(session.sapling_get_best_anchor())
+    assert again['anchor'] == response['anchor']
+    assert len(calls) == 1
+
+
+def test_sapling_best_anchor_fails_closed_when_root_not_consensus():
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db([block])
+    seed_witness_db(db)
+    session = make_session(db, FixtureDaemon([block]))
+    install_fake_helper(session, {
+        'success': True,
+        'anchor': asym32(0xB3).hex(),  # not in b'A'
+        'anchor_height': 404,
+        'tree_size': 4,
+    })
+
+    response = run(session.sapling_get_best_anchor())
+
+    assert response['available'] is False
+    assert response['anchor'] is None
+    assert response['root'] is None
+    assert response['error']['type'] == 'canonical_anchor_unavailable'
+    assert 'index_incomplete' in response['error']['message']
+
+
+def test_sapling_best_anchor_fails_closed_without_canonical_backend(
+        monkeypatch):
+    monkeypatch.delenv(PIVX_SAPLING_WITNESS_HELPER_ENV, raising=False)
+    monkeypatch.setattr('electrumx.server.session.shutil.which',
+                        lambda _name: None)
+    block = load_block_fixture('pivx_mainnet_2703076.json')
+    db = make_sapling_db([block])
+    index_block_sapling(db, block)
+    session = make_session(db, FixtureDaemon([block]))
+
+    response = run(session.sapling_get_best_anchor())
+
+    assert response['available'] is False
+    assert response['anchor'] is None
+    assert response['root'] is None
+    assert response['height'] == block['height']
+    assert response['anchor_height'] is None
+    assert response['block_hash'] == block['hash']
+    assert response['error']['type'] == 'canonical_anchor_unavailable'
+
+
+def test_sapling_best_anchor_returns_structured_response_without_anchor(
+        monkeypatch):
+    monkeypatch.delenv(PIVX_SAPLING_WITNESS_HELPER_ENV, raising=False)
+    monkeypatch.setattr('electrumx.server.session.shutil.which',
+                        lambda _name: None)
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db([block])
+    session = make_session(db, FixtureDaemon([block]))
+
+    response = run(session.sapling_get_best_anchor())
+
+    assert response['available'] is False
+    assert response['anchor'] is None
+    assert response['anchor_height'] is None
+    assert response['height'] == block['height']
+    assert response['block_hash'] == block['hash']
+    assert response['error']['type'] == 'canonical_anchor_unavailable'
+
+
+def test_live_helper_methods_do_not_leak_internal_errors(monkeypatch):
+    monkeypatch.delenv(PIVX_SAPLING_WITNESS_HELPER_ENV, raising=False)
+    monkeypatch.setattr('electrumx.server.session.shutil.which',
+                        lambda _name: None)
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db([block])
+    session = make_session(db, FixtureDaemon([block]))
+    session.set_request_handlers((1, 4))
+
+    best_anchor = run(session.handle_request(
+        Request('blockchain.sapling.get_best_anchor', [])))
+    nullifier_status = run(session.handle_request(Request(
+        'blockchain.sapling.get_nullifier_status', [display(asym32(7))])))
+    commitment_info = run(session.handle_request(Request(
+        'blockchain.sapling.get_commitment_info', [display(asym32(6))])))
+
+    assert best_anchor['available'] is False
+    assert best_anchor['anchor'] is None
+    assert best_anchor['block_hash'] == block['hash']
+    assert nullifier_status['spent'] is False
+    assert commitment_info['exists'] is False

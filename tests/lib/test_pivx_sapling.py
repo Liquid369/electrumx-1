@@ -6,6 +6,8 @@
 
 '''Unit tests for PIVX Sapling deserializer.'''
 
+import struct
+
 from electrumx.lib import tx as tx_lib
 
 
@@ -151,63 +153,65 @@ class TestDeserializerPIVXPreSapling:
         assert tx.txtype == 0
         assert len(tx.inputs) == 1
         assert len(tx.outputs) == 1
+        assert deser.cursor == len(raw)
+
+
+def create_sapling_tx_hex(
+    num_spends=0,
+    num_outputs=0,
+    value_balance=0,
+    tx_type=0,
+    sap_data_present=True,
+    extra_payload=None,
+):
+    '''Create a synthetic v3 PIVX transaction.
+
+    Layout after nLockTime:
+      Optional<SaplingTxData>: 1 presence byte, then when present
+        valueBalance (int64) + vShieldedSpend + vShieldedOutput +
+        bindingSig(64) only if spends+outputs non-empty.
+      For tx_type != 0, Optional<vector<u8>> extraPayload: 1 presence
+        byte + compactsize + data.
+    '''
+    # header uint32: low 16 bits version, high 16 bits type
+    parts = [struct.pack('<HH', 3, tx_type).hex()]
+    parts.append("00")  # no transparent inputs
+    parts.append("00")  # no transparent outputs
+    parts.append("00000000")  # locktime
+
+    if sap_data_present:
+        parts.append("01")  # SaplingTxData present
+        parts.append(struct.pack('<q', value_balance).hex())
+        assert num_spends < 253 and num_outputs < 253
+        parts.append(format(num_spends, '02x'))
+        parts.append("00" * 384 * num_spends)
+        parts.append(format(num_outputs, '02x'))
+        parts.append("00" * 948 * num_outputs)
+        if num_spends or num_outputs:
+            parts.append("00" * 64)  # bindingSig
+    else:
+        parts.append("00")  # SaplingTxData absent
+
+    if tx_type:
+        if extra_payload is None:
+            parts.append("00")  # extraPayload absent
+        else:
+            assert len(extra_payload) < 253
+            parts.append("01")
+            parts.append(format(len(extra_payload), '02x'))
+            parts.append(extra_payload.hex())
+
+    return ''.join(parts)
 
 
 class TestDeserializerPIVXSapling:
     '''Tests for Sapling PIVX transaction parsing with synthetic data.'''
 
-    @staticmethod
-    def create_sapling_tx_hex(
-        num_spends=0,
-        num_outputs=0,
-        value_balance=0,
-    ):
-        '''Create a synthetic Sapling transaction for testing.'''
-        # Version 3 (Sapling)
-        header = "03000000"  # version 3, type 0
-
-        # Empty inputs
-        inputs = "00"
-
-        # Empty transparent outputs
-        outputs = "00"
-
-        # Locktime
-        locktime = "00000000"
-
-        # Expiry height (varint)
-        expiry_height = "00"
-
-        # Value balance (8 bytes, little endian)
-        import struct
-        val_bal = struct.pack('<q', value_balance).hex()
-
-        # Sapling spends count
-        spend_count = format(num_spends, '02x') if num_spends < 253 else None
-        if spend_count is None:
-            raise ValueError("Too many spends for simple test")
-
-        # Sapling spend data (384 bytes each)
-        spend_data = "00" * 384 * num_spends
-
-        # Sapling outputs count
-        output_count = format(num_outputs, '02x') if num_outputs < 253 else None
-        if output_count is None:
-            raise ValueError("Too many outputs for simple test")
-
-        # Sapling output data (948 bytes each)
-        output_data = "00" * 948 * num_outputs
-
-        # Binding signature (64 bytes)
-        binding_sig = "00" * 64
-
-        return (header + inputs + outputs + locktime + expiry_height +
-                val_bal + spend_count + spend_data + output_count +
-                output_data + binding_sig)
+    create_sapling_tx_hex = staticmethod(create_sapling_tx_hex)
 
     def test_empty_sapling_tx(self):
-        '''Test Sapling transaction with no shielded data.'''
-        tx_hex = self.create_sapling_tx_hex()
+        '''Present SaplingTxData with empty vectors: no bindingSig.'''
+        tx_hex = create_sapling_tx_hex()
         raw = bytes.fromhex(tx_hex)
         deser = tx_lib.DeserializerPIVX(raw)
         tx = deser.read_tx()
@@ -216,10 +220,24 @@ class TestDeserializerPIVXSapling:
         assert isinstance(tx, tx_lib.TxPIVX)
         assert not isinstance(tx, tx_lib.TxPIVXSapling)
         assert tx.version == 3
+        # Empty shielded vectors mean no binding signature is serialized
+        assert deser.cursor == len(raw)
+
+    def test_absent_sapling_data(self):
+        '''Presence byte 0: no SaplingTxData payload follows.'''
+        tx_hex = create_sapling_tx_hex(sap_data_present=False)
+        raw = bytes.fromhex(tx_hex)
+        deser = tx_lib.DeserializerPIVX(raw)
+        tx = deser.read_tx()
+
+        assert isinstance(tx, tx_lib.TxPIVX)
+        assert not isinstance(tx, tx_lib.TxPIVXSapling)
+        assert tx.version == 3
+        assert deser.cursor == len(raw)
 
     def test_sapling_tx_with_spends(self):
         '''Test Sapling transaction with spends.'''
-        tx_hex = self.create_sapling_tx_hex(num_spends=2)
+        tx_hex = create_sapling_tx_hex(num_spends=2)
         raw = bytes.fromhex(tx_hex)
         deser = tx_lib.DeserializerPIVX(raw)
         tx = deser.read_tx()
@@ -228,6 +246,8 @@ class TestDeserializerPIVXSapling:
         assert tx.version == 3
         assert len(tx.sapling_spends) == 2
         assert len(tx.sapling_outputs) == 0
+        assert len(tx.binding_sig) == 64
+        assert deser.cursor == len(raw)
 
         # Verify spend structure
         for spend in tx.sapling_spends:
@@ -240,7 +260,7 @@ class TestDeserializerPIVXSapling:
 
     def test_sapling_tx_with_outputs(self):
         '''Test Sapling transaction with outputs.'''
-        tx_hex = self.create_sapling_tx_hex(num_outputs=3)
+        tx_hex = create_sapling_tx_hex(num_outputs=3)
         raw = bytes.fromhex(tx_hex)
         deser = tx_lib.DeserializerPIVX(raw)
         tx = deser.read_tx()
@@ -249,6 +269,7 @@ class TestDeserializerPIVXSapling:
         assert tx.version == 3
         assert len(tx.sapling_spends) == 0
         assert len(tx.sapling_outputs) == 3
+        assert deser.cursor == len(raw)
 
         # Verify output structure
         for output in tx.sapling_outputs:
@@ -261,7 +282,7 @@ class TestDeserializerPIVXSapling:
 
     def test_sapling_tx_with_both(self):
         '''Test Sapling transaction with both spends and outputs.'''
-        tx_hex = self.create_sapling_tx_hex(
+        tx_hex = create_sapling_tx_hex(
             num_spends=1,
             num_outputs=2,
             value_balance=500000,
@@ -275,21 +296,23 @@ class TestDeserializerPIVXSapling:
         assert tx.value_balance == 500000
         assert len(tx.sapling_spends) == 1
         assert len(tx.sapling_outputs) == 2
+        assert deser.cursor == len(raw)
 
     def test_sapling_nullifier_extraction(self):
         '''Test that nullifiers are correctly extracted.'''
         # Create tx with specific nullifier pattern
-        tx_hex = self.create_sapling_tx_hex(num_spends=1)
+        tx_hex = create_sapling_tx_hex(num_spends=1)
         raw = bytearray.fromhex(tx_hex)
 
         # Position of nullifier in spend (after cv:32, anchor:32 = 64 bytes
         # from start of spend data)
         # Spend data starts after: header:4 + inputs:1 + outputs:1 +
-        # locktime:4 + expiry:1 + valueBalance:8 + spendCount:1 = 20 bytes
+        # locktime:4 + sapDataPresence:1 + valueBalance:8 + spendCount:1
+        # = 20 bytes
         # Plus cv:32 + anchor:32 = 84 bytes from start
         nullifier_start = 20 + 32 + 32
         test_nullifier = bytes(range(32))
-        raw[nullifier_start:nullifier_start+32] = test_nullifier
+        raw[nullifier_start:nullifier_start + 32] = test_nullifier
 
         deser = tx_lib.DeserializerPIVX(bytes(raw))
         tx = deser.read_tx()
@@ -299,21 +322,91 @@ class TestDeserializerPIVXSapling:
 
     def test_sapling_commitment_extraction(self):
         '''Test that commitments (cmu) are correctly extracted.'''
-        tx_hex = self.create_sapling_tx_hex(num_outputs=1)
+        tx_hex = create_sapling_tx_hex(num_outputs=1)
         raw = bytearray.fromhex(tx_hex)
 
         # Position of cmu in output (after cv:32 = 32 bytes from start of
         # output data)
         # Output data starts after: header:4 + inputs:1 + outputs:1 +
-        # locktime:4 + expiry:1 + valueBalance:8 + spendCount:1 +
+        # locktime:4 + sapDataPresence:1 + valueBalance:8 + spendCount:1 +
         # outputCount:1 = 21 bytes
         # Plus cv:32 = 53 bytes from start
         cmu_start = 21 + 32
         test_cmu = bytes(range(32))
-        raw[cmu_start:cmu_start+32] = test_cmu
+        raw[cmu_start:cmu_start + 32] = test_cmu
 
         deser = tx_lib.DeserializerPIVX(bytes(raw))
         tx = deser.read_tx()
 
         assert isinstance(tx, tx_lib.TxPIVXSapling)
         assert tx.sapling_outputs[0].cmu == test_cmu
+
+
+class TestDeserializerPIVXSpecialTx:
+    '''Tests for v3 special (DIP2-style) txs with optional trailing data.'''
+
+    def test_special_tx_with_empty_sapling_and_extra_payload(self):
+        '''nVersion=3, nType=6, sapData present with empty vectors (so no
+        bindingSig), followed by an extraPayload blob.'''
+        payload = bytes(range(80))
+        tx_hex = create_sapling_tx_hex(tx_type=6, extra_payload=payload)
+        raw = bytes.fromhex(tx_hex)
+        deser = tx_lib.DeserializerPIVX(raw)
+        tx = deser.read_tx()
+
+        assert isinstance(tx, tx_lib.TxPIVX)
+        assert not isinstance(tx, tx_lib.TxPIVXSapling)
+        assert tx.version == 3
+        assert tx.txtype == 6
+        # The full buffer, including extraPayload, must be consumed
+        assert deser.cursor == len(raw)
+
+    def test_special_tx_absent_optionals(self):
+        '''Both optionals absent: presence bytes are 0.'''
+        tx_hex = create_sapling_tx_hex(tx_type=6, sap_data_present=False)
+        raw = bytes.fromhex(tx_hex)
+        deser = tx_lib.DeserializerPIVX(raw)
+        tx = deser.read_tx()
+
+        assert isinstance(tx, tx_lib.TxPIVX)
+        assert tx.version == 3
+        assert tx.txtype == 6
+        assert deser.cursor == len(raw)
+
+    def test_two_consecutive_special_txs_stay_aligned(self):
+        '''A misread optional would desynchronise the cursor and corrupt
+        the second tx; both must parse and consume the exact buffer.'''
+        first_hex = create_sapling_tx_hex(
+            tx_type=6, extra_payload=bytes(range(80)))
+        second_hex = create_sapling_tx_hex(
+            tx_type=6, extra_payload=bytes(range(80, 160)))
+        raw = bytes.fromhex(first_hex + second_hex)
+
+        deser = tx_lib.DeserializerPIVX(raw)
+        first = deser.read_tx()
+        boundary = deser.cursor
+        second = deser.read_tx()
+
+        assert boundary == len(bytes.fromhex(first_hex))
+        assert deser.cursor == len(raw)
+        assert first.txtype == second.txtype == 6
+        assert first.txid != second.txid
+        # txids cover each tx's exact byte range
+        assert first.txid == tx_lib.double_sha256(raw[:boundary])
+        assert second.txid == tx_lib.double_sha256(raw[boundary:])
+
+    def test_special_tx_with_shielded_data_and_extra_payload(self):
+        '''Shielded vectors and extraPayload can coexist on a special tx.'''
+        tx_hex = create_sapling_tx_hex(
+            num_spends=1, num_outputs=1, tx_type=6,
+            extra_payload=bytes(range(40)))
+        raw = bytes.fromhex(tx_hex)
+        deser = tx_lib.DeserializerPIVX(raw)
+        tx = deser.read_tx()
+
+        assert isinstance(tx, tx_lib.TxPIVXSapling)
+        assert tx.txtype == 6
+        assert len(tx.sapling_spends) == 1
+        assert len(tx.sapling_outputs) == 1
+        assert len(tx.binding_sig) == 64
+        assert deser.cursor == len(raw)

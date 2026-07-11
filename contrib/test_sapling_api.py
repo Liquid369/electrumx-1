@@ -220,31 +220,24 @@ def test_api(host: str, port: int, use_ssl: bool = False):
     except Exception as e:
         print(f"  ✗ Exception: {e}")
 
-    # Test 5: blockchain.sapling.get_nullifiers (SYNC)
-    print("\nTest 5: blockchain.sapling.get_nullifiers (SYNC)")
-    print(f"  Range: {TEST_HEIGHT} to {TEST_HEIGHT}")
+    # Test 5: blockchain.sapling.get_nullifiers is removed; the server
+    # must answer with a structured unsupported-method envelope
+    print("\nTest 5: blockchain.sapling.get_nullifiers (removed)")
     try:
         result = client.call(
             "blockchain.sapling.get_nullifiers",
             [TEST_HEIGHT, TEST_HEIGHT]
         )
-        if "result" in result:
-            r = result['result']
-            nullifiers = r.get('nullifiers', [])
-            print(f"  ✓ Found {len(nullifiers)} nullifier(s)")
-            for nf in nullifiers[:2]:
-                print(f"    - {nf.get('nullifier', 'N/A')[:16]}...")
-                print(f"      txid: {nf.get('txid', 'N/A')[:16]}...")
-                print(f"      height: {nf.get('height')}")
-            if not nullifiers:
-                print("  ⚠ No nullifiers - may need resync")
-                all_passed = False
-        elif "error" in result:
-            print(f"  ✗ Error: {result['error']}")
+        r = result.get('result') or {}
+        error = (r.get('error') or {}) if isinstance(r, dict) else {}
+        if error.get('type') == 'unsupported_method':
+            print("  \u2713 Server reports unsupported_method (clients use "
+                  "get_block_range spends)")
+        else:
+            print(f"  \u2717 Unexpected response: {result}")
             all_passed = False
     except Exception as e:
-        print(f"  ✗ Exception: {e}")
-        all_passed = False
+        print(f"  \u2717 Exception: {e}")
 
     # Test 6: blockchain.sapling.get_tree_state (SYNC)
     print("\nTest 6: blockchain.sapling.get_tree_state (SYNC)")
