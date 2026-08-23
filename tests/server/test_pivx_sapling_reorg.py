@@ -77,6 +77,44 @@ class FakeKV:
         return contextlib.nullcontext(self)
 
 
+class BufferingFakeKV(FakeKV):
+    '''FakeKV whose write_batch buffers writes and applies them only on
+    context exit, modelling a real LevelDB batch.  commit_hook (if set)
+    runs at commit time, just before the buffered ops apply — the
+    widest point of the old publish-before-commit race window.'''
+
+    commit_hook = None
+
+    def write_batch(self):
+        kv = self
+
+        class Batch:
+            def __init__(self):
+                self.ops = []
+
+            def put(self, key, value):
+                self.ops.append(('put', key, value))
+
+            def delete(self, key):
+                self.ops.append(('delete', key))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                if exc_type is None:
+                    if kv.commit_hook is not None:
+                        kv.commit_hook()
+                    for op, key, *rest in self.ops:
+                        if op == 'put':
+                            kv.data[key] = rest[0]
+                        else:
+                            kv.data.pop(key, None)
+                return False
+
+        return Batch()
+
+
 HEADER_SPACING = 1000
 
 
@@ -589,6 +627,11 @@ def test_flush_utxo_db_persists_sapling_data_and_output_count():
 
     db.flush_utxo_db(db.utxo_db, flush_data)
 
+    # Heights are staged, not published, until the batch commits
+    assert db.db_height == 0
+    assert db.sapling_output_count == 0
+    db.publish_flushed_state()
+
     # Persisted atomically with the UTXO flush
     assert db.sapling_output_count == 1
     assert db.db_height == 5
@@ -623,6 +666,7 @@ def test_flush_utxo_db_applies_pending_backup_purge():
         sapling_output_count=0,
     )
     db.flush_utxo_db(db.utxo_db, flush_data)
+    db.publish_flushed_state()
 
     assert db.sapling_output_count == 0
     assert db.get_nullifier_spend(nf) is None
@@ -853,6 +897,7 @@ def test_sapling_capabilities_do_not_advertise_release_ready_without_witness_bac
         'block_hashes': True,
         'structured_errors': True,
         'canonical_witnesses': False,
+        'consistent_db_height': True,
     }
     assert capabilities['hex_byte_order'] == 'display'
     assert capabilities['consensus_anchors'] is True
@@ -2316,3 +2361,271 @@ def test_capabilities_advertise_active_height_index(monkeypatch):
     assert capabilities['aliases'][
         'blockchain.sapling.get_active_heights'] == [
             'sapling.get_active_heights']
+
+
+# ---------------------------------------------------------------------------
+# db_height as a committed watermark (commit-then-publish)
+# ---------------------------------------------------------------------------
+
+def _flushable_db():
+    '''A fixture DB wired so full flush_dbs/flush_backup runs, with a
+    batch-faithful KV: writes apply only at batch commit.'''
+    db = make_sapling_db()
+    db.utxo_db = BufferingFakeKV()
+    db.history = mock.Mock(flush_count=1)
+    db.history.assert_flushed = lambda: None
+
+    def fake_flush_fs(fd):
+        # Real flush_fs writes files then updates the fs pointers
+        db.fs_height = fd.height
+        db.fs_tx_count = fd.tx_count
+
+    db.flush_fs = fake_flush_fs
+    db.flush_history = lambda: None
+    db.backup_fs = lambda _height, _tx_count: None
+    db.last_flush = 0.0
+    db.last_flush_tx_count = 0
+    db.fs_tx_count = 0
+    return db
+
+
+def _advance_flush_data(cm, nf):
+    return FlushData(
+        5, 9, [], [], [], {}, [], b't' * 32,
+        sapling_nullifiers=[(nf, b'h' * 32, 5, 0)],
+        sapling_commitments=[(cm, b'h' * 32, 0, 5, 0)],
+        sapling_anchors=[(asym32(0x83), 5, 1)],
+        sapling_output_count=1,
+    )
+
+
+def test_db_height_publishes_only_after_batch_commit():
+    '''A reader at the widest point of the old race window (heights
+    assigned, batch not yet committed) must see the OLD consistent
+    view: old db_height AND no new rows.  Regression for the live bug
+    where get_active_heights omitted a just-flushed block while
+    db_height already covered it (block 5553285).'''
+    db = _flushable_db()
+    cm, nf = asym32(0x81), asym32(0x82)
+    observed = {}
+
+    def commit_hook():
+        observed['db_height'] = db.db_height
+        observed['output_count'] = db.sapling_output_count
+        observed['active'] = db.get_sapling_active_heights(0, 10 ** 9, 10)
+        observed['commitment'] = db.get_commitment_position_info(cm)
+
+    db.utxo_db.commit_hook = commit_hook
+
+    db.flush_dbs(_advance_flush_data(cm, nf), True,
+                 estimate_txs_remaining=lambda: 0)
+
+    # At commit time nothing was published: watermark still old,
+    # matching the still-invisible rows
+    assert observed == {
+        'db_height': 0,
+        'output_count': 0,
+        'active': ([], True),
+        'commitment': None,
+    }
+    # After the flush returns, everything is visible together
+    assert db.db_height == 5
+    assert db.sapling_output_count == 1
+    assert db.get_sapling_active_heights(0, 100, 10) == ([5], True)
+    assert db.get_commitment_position_info(cm) == (b'h' * 32, 0, 5, 0)
+    # The persisted state carries the NEW heights (written inside the
+    # same batch as the rows)
+    state = ast.literal_eval(db.utxo_db.get(b'state').decode())
+    assert state['height'] == 5
+    assert state['sapling_output_count'] == 1
+
+
+def test_backup_publishes_lowered_heights_only_after_purge_commits():
+    db = _flushable_db()
+    cm, nf = asym32(0x84), asym32(0x85)
+    db.flush_dbs(_advance_flush_data(cm, nf), True,
+                 estimate_txs_remaining=lambda: 0)
+    assert db.db_height == 5
+
+    observed = {}
+
+    def commit_hook():
+        observed['db_height'] = db.db_height
+        observed['active'] = db.get_sapling_active_heights(0, 100, 10)
+        observed['commitment'] = db.get_commitment_position_info(cm)
+
+    db.utxo_db.commit_hook = commit_hook
+    backup_data = FlushData(
+        4, 8, [], [], [], {}, [], b'u' * 32,
+        sapling_delete_nullifiers=[nf],
+        sapling_delete_commitments=[cm],
+        sapling_backup_height_start=5,
+        sapling_output_count=0,
+    )
+
+    db.flush_backup(backup_data, touched=set())
+
+    # At commit time the watermark is ALREADY lowered while the purged
+    # rows are still readable — the safe direction: no reader can hold
+    # db_height 5 after its rows vanish.  Surviving rows above the
+    # watermark are harmless (range reads clamp to db_height).
+    assert observed == {
+        'db_height': 4,
+        'active': ([5], True),
+        'commitment': (b'h' * 32, 0, 5, 0),
+    }
+    # After: watermark lowered and rows purged, atomically
+    assert db.db_height == 4
+    assert db.sapling_output_count == 0
+    assert db.get_sapling_active_heights(0, 100, 10) == ([], True)
+    assert db.get_commitment_position_info(cm) is None
+    state = ast.literal_eval(db.utxo_db.get(b'state').decode())
+    assert state['height'] == 4
+    assert state['sapling_output_count'] == 0
+
+
+def test_capabilities_advertise_consistent_db_height(monkeypatch):
+    monkeypatch.delenv(PIVX_SAPLING_WITNESS_HELPER_ENV, raising=False)
+    monkeypatch.setattr('electrumx.server.session.shutil.which',
+                        lambda _name: None)
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db([block])
+    session = make_session(db, FixtureDaemon([block]))
+
+    capabilities = run(session.sapling_capabilities())
+
+    assert capabilities['features']['consistent_db_height'] is True
+
+
+def test_failed_batch_publishes_for_upstream_failure_semantics():
+    '''If the batch fails to commit, the staged heights are still
+    published (memory ahead of disk, matching upstream's pre-fix
+    failure behavior) and cleared, so the shutdown flush early-exits
+    via assert_flushed instead of persisting state for rows the dead
+    batch lost.'''
+    db = _flushable_db()
+    cm, nf = asym32(0x86), asym32(0x87)
+
+    def boom():
+        raise RuntimeError('commit failed')
+
+    db.utxo_db.commit_hook = boom
+    flush_data = _advance_flush_data(cm, nf)
+
+    with pytest.raises(RuntimeError, match='commit failed'):
+        db.flush_dbs(flush_data, True, estimate_txs_remaining=lambda: 0)
+
+    assert db.db_height == 5
+    assert db._staged_publish is None
+    assert db.utxo_db.get(b'state') is None  # nothing committed
+
+    # The shutdown flush retry must write nothing (assert_flushed path)
+    db.utxo_db.commit_hook = None
+    db.flush_dbs(flush_data, True, estimate_txs_remaining=lambda: 0)
+    assert db.utxo_db.get(b'state') is None
+
+
+def test_get_active_heights_detects_mid_request_reorg():
+    '''A request that snapshots db_height, then has a reorg purge land
+    before its scan, must fail retryable (index_incomplete) instead of
+    returning complete:true without the purged height — the response
+    carries no block_hashes, so a silent partial answer would let a
+    wallet skip a replacement shielded block forever.'''
+    db = make_sapling_db()
+    db.db_height = 5
+    _flush_activity(db, outputs=[5])
+    session = make_session(db, FixtureDaemon([]))
+
+    real_scan = db.get_sapling_active_heights
+
+    def scan_after_reorg(start, end, limit):
+        # The reorg lands between the handler's snapshot and the scan:
+        # watermark lowered, height-5 rows purged
+        db.backup_sapling_data(db.utxo_db, [], [], height_start=5)
+        db.db_height = 4
+        return real_scan(start, end, limit)
+
+    db.get_sapling_active_heights = scan_after_reorg
+
+    response = run(session.sapling_get_active_heights(0, 5, 10))
+
+    assert response['heights'] == []
+    assert response['complete'] is False
+    assert response['error']['type'] == 'index_incomplete'
+    assert response['error']['retryable'] is True
+    assert response['error']['indexed_height'] == 4
+    assert response['db_height'] == 4
+    assert response['end'] == 4
+
+    # The retry against the new watermark succeeds consistently
+    db.get_sapling_active_heights = real_scan
+    retry = run(session.sapling_get_active_heights(0, 4, 10))
+    assert retry['complete'] is True
+    assert retry['heights'] == []
+
+
+def test_backup_flush_increments_reorg_count_advance_does_not():
+    db = _flushable_db()
+    cm, nf = asym32(0x88), asym32(0x89)
+    assert db.sapling_reorg_count == 0
+
+    db.flush_dbs(_advance_flush_data(cm, nf), True,
+                 estimate_txs_remaining=lambda: 0)
+    assert db.sapling_reorg_count == 0
+
+    backup_data = FlushData(
+        4, 8, [], [], [], {}, [], b'u' * 32,
+        sapling_delete_nullifiers=[nf],
+        sapling_delete_commitments=[cm],
+        sapling_backup_height_start=5,
+        sapling_output_count=0,
+    )
+    db.flush_backup(backup_data, touched=set())
+    assert db.sapling_reorg_count == 1
+
+
+def test_get_active_heights_detects_same_height_replacement_reorg():
+    '''Down-and-back-up: the reorg purges height 5 and the replacement
+    branch regrows to 5 before the handler re-reads db_height.  The
+    height check alone cannot see it; the reorg counter must.'''
+    db = make_sapling_db()
+    db.db_height = 5
+    _flush_activity(db, outputs=[5])
+    session = make_session(db, FixtureDaemon([]))
+
+    real_scan = db.get_sapling_active_heights
+
+    def scan_during_replacement(start, end, limit):
+        result = real_scan(start, end, limit)
+        # After the scan: backup publishes (counter moves), replacement
+        # branch reflushes different activity at the same height
+        db.backup_sapling_data(db.utxo_db, [], [], height_start=5)
+        db.sapling_reorg_count += 1
+        db.flush_sapling_data(
+            db.utxo_db, [], [(asym32(0x8A), b'r' * 32, 0, 5, 0)], [])
+        return result
+
+    db.get_sapling_active_heights = scan_during_replacement
+
+    response = run(session.sapling_get_active_heights(0, 5, 10))
+
+    assert response['complete'] is False
+    assert response['error']['type'] == 'index_incomplete'
+    assert response['error']['retryable'] is True
+    assert response['heights'] == []
+
+
+def test_get_outputs_detects_mid_request_reorg():
+    block = load_block_fixture('pivx_mainnet_5057529.json')
+    db = make_sapling_db([block])
+    index_block_sapling(db, block)
+
+    class ReorgingDaemon(FixtureDaemon):
+        async def raw_blocks(self, block_hashes):
+            db.sapling_reorg_count += 1
+            return await super().raw_blocks(block_hashes)
+
+    session = make_session(db, ReorgingDaemon([block]))
+
+    with pytest.raises(RPCError, match='index_incomplete'):
+        run(session.sapling_get_outputs(block['height'], block['height']))

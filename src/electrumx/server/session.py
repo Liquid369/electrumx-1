@@ -66,6 +66,9 @@ PIVX_SAPLING_RELEASE_FEATURES = {
     'block_hashes': True,
     'structured_errors': True,
     'canonical_witnesses': False,
+    # db_height is a committed watermark: any X <= db_height is fully
+    # queryable on every Sapling read path, never empty-then-populated
+    'consistent_db_height': True,
 }
 PIVX_SAPLING_WITNESS_HELPER_ENV = 'PIVX_SAPLING_WITNESS_HELPER'
 PIVX_SAPLING_WITNESS_HELPER_TIMEOUT_ENV = (
@@ -2864,6 +2867,9 @@ class PIVXSaplingElectrumX(ElectrumX):
         limit = max(1, min(non_negative_integer(limit),
                            PIVX_SAPLING_ACTIVE_HEIGHTS_MAX_LIMIT))
 
+        # Captured before the height snapshot; a moved counter after
+        # the scan means a reorg touched the data mid-request
+        reorg_marker = self.db.sapling_reorg_count
         db_height = self.db.db_height
         response = {
             'heights': [],
@@ -2883,9 +2889,30 @@ class PIVXSaplingElectrumX(ElectrumX):
             return response
 
         self.bump_cost(1.0)
+        scan_end = min(end_height, db_height)
         heights, complete = await run_in_thread(
             self.db.get_sapling_active_heights,
-            start_height, min(end_height, db_height), limit)
+            start_height, scan_end, limit)
+        # Re-validate: if a reorg touched the index while the scan ran,
+        # the purged range may have been scanned against a stale bound
+        # (the counter also catches a replacement branch that regrew to
+        # the same height).  This response authorizes the client to
+        # skip blocks without any block_hashes to cross-check, so a
+        # silent partial answer here is a permanent client-side skip —
+        # fail retryable instead.
+        current_height = self.db.db_height
+        if (current_height < scan_end
+                or self.db.sapling_reorg_count != reorg_marker):
+            response['complete'] = False
+            response['db_height'] = current_height
+            response['end'] = min(end_height, current_height)
+            response['error'] = {
+                'type': 'index_incomplete',
+                'message': 'chain reorganized during the request',
+                'retryable': True,
+                'indexed_height': current_height,
+            }
+            return response
         self.bump_cost(len(heights) / 5000)
         response['heights'] = heights
         response['complete'] = complete
@@ -2923,10 +2950,15 @@ class PIVXSaplingElectrumX(ElectrumX):
             raise RPCError(
                 BAD_REQUEST,
                 f'range too large, max {PIVX_SAPLING_MAX_BLOCK_RANGE} blocks')
+        # Like get_active_heights, this response carries no block
+        # hashes the client could cross-check, so a mid-request reorg
+        # must fail retryable rather than serve a mixed-branch feed
+        reorg_marker = self.db.sapling_reorg_count
         if end_height > self.db.db_height:
             raise RPCError(
                 BAD_REQUEST,
-                f'range extends above indexed tip {self.db.db_height:,d}')
+                f'index_incomplete: range extends above indexed tip '
+                f'{self.db.db_height:,d}')
 
         # Cost based on range size
         self.bump_cost(2.0 + block_count * 0.1)
@@ -2980,6 +3012,12 @@ class PIVXSaplingElectrumX(ElectrumX):
                             'enc_ciphertext': output.enc_ciphertext.hex(),
                         })
                         output_count += 1
+
+        if (self.db.sapling_reorg_count != reorg_marker
+                or self.db.db_height < end_height):
+            raise RPCError(
+                BAD_REQUEST,
+                'index_incomplete: chain reorganized during the request')
 
         return {
             'outputs': outputs,

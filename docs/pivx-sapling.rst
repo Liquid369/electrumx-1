@@ -136,7 +136,8 @@ Sapling sync/send routes.  A production-ready server returns (abridged):
        "global_output_positions": true,
        "block_hashes": true,
        "structured_errors": true,
-       "canonical_witnesses": true
+       "canonical_witnesses": true,
+       "consistent_db_height": true
      },
      "witness_response": "canonical_path",
      "witness_path_length": 32,
@@ -163,6 +164,30 @@ the ``pivx_sapling_witness`` helper is configured on the server;
 ``release_contract_ready`` is only true when all features are available and
 the index has caught up to the daemon tip.  Cake Wallet treats legacy
 servers without this v1 release contract as compatibility-only.
+
+``features.consistent_db_height: true`` declares that ``db_height`` is a
+**committed watermark**: the new heights of a flush are published only
+after the write batch carrying that flush's rows has committed, so for
+any height ``X <= db_height`` every Sapling read path (``get_block_range``,
+``get_outputs``, ``get_active_heights``, ``get_tree_state``,
+``get_commitment_info``, witness/anchor lookups) already serves X's final
+committed data — there is no instant at which ``db_height >= X`` while X
+reads empty or incomplete, and no empty-then-populated flip for a
+just-indexed block.  On reorg the guarantee is directional the other
+way: the lowered ``db_height`` is published *before* the rolled-back
+rows can disappear (the watermark never promises reverted heights), and
+the purge plus the lowered persisted state commit in one atomic batch.
+``get_active_heights`` and ``get_outputs`` — the two feeds that carry
+no per-height block hashes for the client to cross-check — additionally
+re-validate against a monotonic reorg counter after reading: a request
+that straddles a reorg (even one whose replacement branch regrew to the
+same height) returns a retryable ``index_incomplete`` error instead of
+a silently incomplete result.  ``get_block_range`` responses carry
+``block_hashes``, which the standard reorg rescan policy cross-checks.
+A client may therefore scan exactly up to ``db_height`` and advance its
+cursor without a safety margin (keeping the standard reorg rescan
+policy); on servers lacking this flag, stay a few blocks behind
+``db_height`` or re-verify recently scanned blocks.
 
 Production v1 method surface:
 

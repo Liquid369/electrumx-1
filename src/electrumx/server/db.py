@@ -84,6 +84,17 @@ class DB:
     # a resync.
     SAPLING_INDEX_VERSION = 1
 
+    # Heights staged by an in-flight flush, published to readers only
+    # after the write batch commits (see publish_flushed_state)
+    _staged_publish = None
+
+    # Monotonic count of published backups (reorgs).  Read paths that
+    # authorize clients to skip blocks capture it before reading and
+    # fail retryable if it moved — a height comparison alone cannot
+    # detect a reorg whose replacement branch regrows to the same
+    # height mid-request.
+    sapling_reorg_count = 0
+
     utxo_db: Optional['Storage']
 
     class DBError(Exception):
@@ -263,10 +274,19 @@ class DB:
         self.flush_history()
 
         # Flush state last as it reads the wall time.
-        with self.utxo_db.write_batch() as batch:
-            if flush_utxos:
-                self.flush_utxo_db(batch, flush_data)
-            self.flush_state(batch)
+        try:
+            with self.utxo_db.write_batch() as batch:
+                if flush_utxos:
+                    self.flush_utxo_db(batch, flush_data)
+                self.flush_state(batch)
+        finally:
+            # On success: only now that the batch has committed may
+            # readers see the new heights (commit-then-publish).  On a
+            # failed batch: publishing anyway restores upstream's
+            # memory-ahead-of-disk failure semantics, so a shutdown
+            # flush early-exits via assert_flushed instead of writing
+            # state for rows the dead batch lost.
+            self.publish_flushed_state()
 
         # Update and put the wall time again - otherwise we drop the
         # time it took to commit the batch
@@ -394,8 +414,14 @@ class DB:
         # The persisted count advances only here, atomically with the
         # Sapling index writes and db_height, so a crash can never
         # leave the counter ahead of the flushed index.
+        staged = {
+            'utxo_flush_count': self.history.flush_count,
+            'db_height': flush_data.height,
+            'db_tx_count': flush_data.tx_count,
+            'db_tip': flush_data.tip,
+        }
         if flush_data.sapling_output_count is not None:
-            self.sapling_output_count = flush_data.sapling_output_count
+            staged['sapling_output_count'] = flush_data.sapling_output_count
 
         if self.utxo_db.for_sync:
             block_count = flush_data.height - self.db_height
@@ -408,10 +434,14 @@ class DB:
             if sapling_count > 0:
                 self.logger.info(f'flushed {sapling_count:,d} Sapling items')
 
-        self.utxo_flush_count = self.history.flush_count
-        self.db_height = flush_data.height
-        self.db_tx_count = flush_data.tx_count
-        self.db_tip = flush_data.tip
+        # This flush runs in a thread while the event loop serves reads
+        # that gate on db_height.  The new heights must not be visible
+        # before the batch carrying their rows has committed, or a
+        # client sees db_height >= X while X's Sapling data is still
+        # unreadable (and, via get_active_heights, silently skips X
+        # forever).  Stage them; flush_dbs/flush_backup publish after
+        # the batch context exits.
+        self._staged_publish = staged
 
     def flush_state(self, batch):
         '''Flush chain state to the batch.'''
@@ -420,6 +450,30 @@ class DB:
         self.last_flush = now
         self.last_flush_tx_count = self.fs_tx_count
         self.write_utxo_state(batch)
+
+    def publish_flushed_state(self):
+        '''Make the heights staged by flush_utxo_db visible to readers.
+
+        Must be called only after the write batch carrying the
+        corresponding rows has committed, so a concurrent reader can
+        never observe a db_height whose data is not yet queryable.
+        db_height is the readers' watermark: on advance it is published
+        last, on backup first — it always lags the data it promises.
+        '''
+        staged = self._staged_publish
+        if staged is None:
+            return
+        self._staged_publish = None
+        new_height = staged.pop('db_height')
+        if new_height >= self.db_height:
+            for name, value in staged.items():
+                setattr(self, name, value)
+            self.db_height = new_height
+        else:
+            self.db_height = new_height
+            for name, value in staged.items():
+                setattr(self, name, value)
+            self.sapling_reorg_count += 1
 
     def flush_backup(self, flush_data, touched):
         '''Like flush_dbs() but when backing up.  All UTXOs are flushed.'''
@@ -433,10 +487,24 @@ class DB:
 
         self.backup_fs(flush_data.height, flush_data.tx_count)
         self.history.backup(touched, flush_data.tx_count)
-        with self.utxo_db.write_batch() as batch:
-            self.flush_utxo_db(batch, flush_data)
-            # Flush state last as it reads the wall time.
-            self.flush_state(batch)
+        try:
+            with self.utxo_db.write_batch() as batch:
+                self.flush_utxo_db(batch, flush_data)
+                # Inverse of the advance ordering: publish the LOWERED
+                # watermark before the purge commits, so no reader ever
+                # holds a db_height whose rows have already vanished.
+                # Rows above the watermark surviving until commit is
+                # harmless — range reads clamp to db_height.  flush_state
+                # then persists the published (lowered) values into the
+                # same atomic batch as the purge.
+                self.publish_flushed_state()
+                # Flush state last as it reads the wall time.
+                self.flush_state(batch)
+        finally:
+            # No-op when the inner publish ran; on an earlier failure it
+            # clears staged state with upstream failure semantics (see
+            # flush_dbs)
+            self.publish_flushed_state()
 
         elapsed = self.last_flush - start_time
         self.logger.info(f'backup flush #{self.history.flush_count:,d} took '
@@ -804,17 +872,26 @@ class DB:
         self.logger.info('DB 2 of 3 upgraded successfully')
 
     def write_utxo_state(self, batch):
-        '''Write (UTXO) state to the batch.'''
+        '''Write (UTXO) state to the batch.
+
+        During a flush the new heights are staged, not yet assigned
+        (readers must not see them until the batch commits), so the
+        persisted state prefers staged values: on disk the state and
+        the rows it describes always land in the same batch.
+        '''
+        staged = self._staged_publish or {}
         state = {
             'genesis': self.coin.GENESIS_HASH,
-            'height': self.db_height,
-            'tx_count': self.db_tx_count,
-            'tip': self.db_tip,
-            'utxo_flush_count': self.utxo_flush_count,
+            'height': staged.get('db_height', self.db_height),
+            'tx_count': staged.get('db_tx_count', self.db_tx_count),
+            'tip': staged.get('db_tip', self.db_tip),
+            'utxo_flush_count': staged.get('utxo_flush_count',
+                                           self.utxo_flush_count),
             'wall_time': self.wall_time,
             'first_sync': self.first_sync,
             'db_version': self.db_version,
-            'sapling_output_count': self.sapling_output_count,
+            'sapling_output_count': staged.get('sapling_output_count',
+                                               self.sapling_output_count),
             'sapling_index_version': self.SAPLING_INDEX_VERSION,
             'sapling_active_heights_built': self.sapling_active_heights_built,
         }
