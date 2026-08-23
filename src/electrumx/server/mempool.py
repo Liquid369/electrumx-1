@@ -35,6 +35,23 @@ class MemPoolTx:
     out_pairs = attr.ib()  # type: Sequence[Tuple[bytes, int]]  # (hashX, value_in_sats)
     fee = attr.ib()        # type: int  # in sats
     size = attr.ib()       # type: int  # in vbytes
+    # (first_seen, spends, outputs) for PIVX Sapling-carrying txs, else
+    # None.  Rides on the tx so it enters/leaves the mempool atomically
+    # with it — no separate lifecycle to reconcile.
+    sapling = attr.ib(default=None)
+
+
+def sapling_components(tx):
+    '''(first_seen, spends, outputs) if the tx carries Sapling data.
+
+    Raw deserializer namedtuples, serialization byte order; the RPC
+    boundary converts to display order.
+    '''
+    spends = getattr(tx, 'sapling_spends', None) or ()
+    outputs = getattr(tx, 'sapling_outputs', None) or ()
+    if not spends and not outputs:
+        return None
+    return (int(time.time()), tuple(spends), tuple(outputs))
 
 
 @attr.s(slots=True)
@@ -355,6 +372,7 @@ class MemPool:
                     out_pairs=txout_pairs,
                     fee=0,
                     size=tx_size,
+                    sapling=sapling_components(tx),
                 )
             return txs
 

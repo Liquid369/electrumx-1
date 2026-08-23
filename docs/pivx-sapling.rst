@@ -137,7 +137,8 @@ Sapling sync/send routes.  A production-ready server returns (abridged):
        "block_hashes": true,
        "structured_errors": true,
        "canonical_witnesses": true,
-       "consistent_db_height": true
+       "consistent_db_height": true,
+       "supports_mempool": true
      },
      "witness_response": "canonical_path",
      "witness_path_length": 32,
@@ -203,6 +204,8 @@ Production v1 method surface:
      - ``blockchain.sapling.get_blocks``, ``sapling.get_block_range``, ``get_block_range``
    * - ``blockchain.sapling.get_active_heights``
      - ``sapling.get_active_heights``
+   * - ``blockchain.sapling.get_mempool``
+     - ``sapling.get_mempool``
    * - ``blockchain.sapling.get_nullifier_status``
      - ``blockchain.sapling.check_nullifier``, ``sapling.get_nullifier_status``
    * - ``blockchain.sapling.check_nullifiers``
@@ -430,6 +433,62 @@ The index is maintained atomically with the rest of the Sapling index
 and is rebuilt automatically (one-time, from the existing
 commitment/nullifier indexes) when a server synced before this method
 existed restarts -- no resync is required.
+
+blockchain.sapling.get_mempool
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Sapling components of every unconfirmed mempool transaction, for 0-conf
+shielded visibility (modeled on Zcash lightwalletd's
+``GetMempoolStream``).  The client trial-decrypts the outputs locally
+with its viewing key; the server never learns which notes belong to the
+wallet.  Feature-detect via ``features.supports_mempool`` and poll on
+the existing shielded-sync cadence.
+
+**Params:** none.  Read-only, idempotent snapshot.
+
+**Result:**
+
+.. code-block:: python
+
+   {
+       'txs': [
+           {
+               'txid': '<hex>',
+               'first_seen': 1690000000,   # unix time first processed
+               'outputs': [
+                   {'cmu': '...', 'epk': '...', 'ephemeral_key': '...',
+                    'cv': '...', 'ciphertext': '...',
+                    'enc_ciphertext': '...', 'out_ciphertext': '...'},
+               ],
+               'spends': [
+                   {'nullifier': '...', 'cv': '...', 'anchor': '...',
+                    'rk': '...'},
+               ],
+           },
+       ],
+       'truncated': False,
+   }
+
+Invariants:
+
+- Byte order is identical to ``get_block_range``: 32-byte fields
+  (``cmu``, ``epk``, ``cv``, ``nullifier``, ``anchor``, ``rk``) in
+  display order, ciphertexts as raw wire bytes.  The same tx later
+  mined carries byte-for-byte identical ``cmu``/``epk``/ciphertext
+  values in ``get_block_range``; clients dedup by txid + ``cmu``.
+- Mempool outputs have **no tree position and no anchor validation** —
+  ``position``/``global_position``/``index`` fields are deliberately
+  absent (never zero-filled).  Render decrypted notes as "incoming,
+  not spendable" until the tx appears at a real height.
+- Mempool contents never affect ``db_height``, ``daemon_height``, tree
+  state, or the Sapling index.
+- Bounded: at most 1000 txs / 10000 outputs per response;
+  ``truncated: true`` when the cap was hit.
+- Not ready (no snapshot yet, or the server trails its daemon beyond
+  the routine 1-2 block processing window): ``{'txs': [], 'truncated':
+  false, 'error': {'type': 'mempool_not_ready', 'message': '...',
+  'retryable': true}}`` — distinguish from a genuinely empty mempool,
+  which has no ``error``.
 
 blockchain.sapling.get_outputs
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

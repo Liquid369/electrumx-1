@@ -898,6 +898,7 @@ def test_sapling_capabilities_do_not_advertise_release_ready_without_witness_bac
         'structured_errors': True,
         'canonical_witnesses': False,
         'consistent_db_height': True,
+        'supports_mempool': True,
     }
     assert capabilities['hex_byte_order'] == 'display'
     assert capabilities['consensus_anchors'] is True
@@ -2629,3 +2630,145 @@ def test_get_outputs_detects_mid_request_reorg():
 
     with pytest.raises(RPCError, match='index_incomplete'):
         run(session.sapling_get_outputs(block['height'], block['height']))
+
+
+# ---------------------------------------------------------------------------
+# Mempool 0-conf feed (blockchain.sapling.get_mempool)
+# ---------------------------------------------------------------------------
+
+from electrumx.server.mempool import MemPoolTx, sapling_components
+
+
+def _mempool_tx(tx, first_seen=1690000000):
+    return MemPoolTx(
+        prevouts=(), in_pairs=None, out_pairs=(), fee=0, size=300,
+        sapling=(first_seen, tuple(tx.sapling_spends),
+                 tuple(tx.sapling_outputs)),
+    )
+
+
+def _fixture_sapling_tx():
+    block = load_block_fixture('pivx_mainnet_5057529.json')
+    tx = next(t for t in parse_block_txs(block)
+              if isinstance(t, tx_lib.TxPIVXSapling)
+              and (t.sapling_outputs or t.sapling_spends))
+    return block, tx
+
+
+def test_sapling_components_extracts_only_sapling_txs():
+    _block, tx = _fixture_sapling_tx()
+    components = sapling_components(tx)
+    assert components is not None
+    _first_seen, spends, outputs = components
+    assert outputs == tuple(tx.sapling_outputs)
+    assert spends == tuple(tx.sapling_spends)
+    # Non-sapling txs carry None (no per-tx overhead)
+    assert sapling_components(SimpleNamespace()) is None
+    assert sapling_components(
+        SimpleNamespace(sapling_spends=[], sapling_outputs=[])) is None
+
+
+def test_get_mempool_matches_block_range_bytes():
+    '''Acceptance: a mempool tx serves byte-for-byte the same
+    cmu/epk/ciphertext hex it later carries in get_block_range.'''
+    block, tx = _fixture_sapling_tx()
+    db = make_sapling_db([block])
+    index_block_sapling(db, block)
+    session = make_session(db, FixtureDaemon([block]))
+    session.mempool = SimpleNamespace(txs={tx.txid: _mempool_tx(tx)})
+
+    mem = run(session.sapling_get_mempool())
+    range_response = run(session.sapling_get_block_range(
+        block['height'], block['height']))
+
+    assert 'error' not in mem
+    assert mem['truncated'] is False
+    mem_tx = next(t for t in mem['txs']
+                  if t['txid'] == hash_to_hex_str(tx.txid))
+    confirmed_tx = next(t for t in range_response['blocks'][0]['txs']
+                        if t['txid'] == mem_tx['txid'])
+    assert mem_tx['first_seen'] == 1690000000
+    for mem_out, conf_out in zip(mem_tx['outputs'], confirmed_tx['outputs']):
+        for field in ('cmu', 'epk', 'ephemeral_key', 'cv',
+                      'ciphertext', 'enc_ciphertext', 'out_ciphertext'):
+            assert mem_out[field] == conf_out[field]
+    for mem_spend, conf_spend in zip(mem_tx['spends'],
+                                     confirmed_tx['spends']):
+        for field in ('nullifier', 'cv', 'anchor', 'rk'):
+            assert mem_spend[field] == conf_spend[field]
+    # Invariant: no tree position of any kind on mempool outputs
+    for mem_out in mem_tx['outputs']:
+        assert not {'position', 'global_position', 'index',
+                    'output_index', 'tree_position'} & set(mem_out)
+
+
+def test_get_mempool_skips_transparent_txs_and_bounds():
+    _block, tx = _fixture_sapling_tx()
+    db = make_sapling_db()
+    db.db_height = 100
+    session = make_session(db, FixtureDaemon([]))
+    transparent = MemPoolTx(prevouts=(), in_pairs=None, out_pairs=(),
+                            fee=0, size=200)
+    session.mempool = SimpleNamespace(txs={
+        b'\1' * 32: transparent,
+        tx.txid: _mempool_tx(tx),
+    })
+
+    response = run(session.sapling_get_mempool())
+
+    assert [t['txid'] for t in response['txs']] == [
+        hash_to_hex_str(tx.txid)]
+    assert response['truncated'] is False
+
+
+def test_get_mempool_truncates_at_cap(monkeypatch):
+    _block, tx = _fixture_sapling_tx()
+    db = make_sapling_db()
+    db.db_height = 100
+    session = make_session(db, FixtureDaemon([]))
+    session.mempool = SimpleNamespace(txs={
+        bytes([n]) * 32: _mempool_tx(tx) for n in range(3)
+    })
+    monkeypatch.setattr(
+        'electrumx.server.session.PIVX_SAPLING_MEMPOOL_MAX_TXS', 2)
+
+    response = run(session.sapling_get_mempool())
+
+    assert len(response['txs']) == 2
+    assert response['truncated'] is True
+
+
+def test_get_mempool_not_ready_when_index_lags():
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db([block])
+    db.db_height = block['height'] - 3
+    session = make_session(
+        db, LaggingDaemon([block], cached_height=block['height']))
+    session.mempool = SimpleNamespace(txs={})
+
+    response = run(session.sapling_get_mempool())
+
+    assert response['txs'] == []
+    assert response['error']['type'] == 'mempool_not_ready'
+    assert response['error']['retryable'] is True
+
+    # Missing mempool (not yet constructed) is also not-ready
+    session2 = make_session(make_sapling_db(), FixtureDaemon([]))
+    response2 = run(session2.sapling_get_mempool())
+    assert response2['error']['type'] == 'mempool_not_ready'
+
+
+def test_capabilities_advertise_mempool(monkeypatch):
+    monkeypatch.delenv(PIVX_SAPLING_WITNESS_HELPER_ENV, raising=False)
+    monkeypatch.setattr('electrumx.server.session.shutil.which',
+                        lambda _name: None)
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db([block])
+    session = make_session(db, FixtureDaemon([block]))
+
+    capabilities = run(session.sapling_capabilities())
+
+    assert capabilities['features']['supports_mempool'] is True
+    assert 'blockchain.sapling.get_mempool' in capabilities['methods']
+    assert capabilities['aliases']['blockchain.sapling.get_mempool'] == [
+        'sapling.get_mempool']

@@ -53,6 +53,8 @@ BAD_REQUEST = 1
 DAEMON_ERROR = 2
 PIVX_SAPLING_MAX_BLOCK_RANGE = 100
 PIVX_SAPLING_ACTIVE_HEIGHTS_MAX_LIMIT = 50000
+PIVX_SAPLING_MEMPOOL_MAX_TXS = 1000
+PIVX_SAPLING_MEMPOOL_MAX_OUTPUTS = 10000
 PIVX_SAPLING_RPC_CONTRACT = 'pivx.sapling.electrumx.v1'
 PIVX_SAPLING_RELEASE_METHODS = [
     'blockchain.sapling.get_block_range',
@@ -69,6 +71,8 @@ PIVX_SAPLING_RELEASE_FEATURES = {
     # db_height is a committed watermark: any X <= db_height is fully
     # queryable on every Sapling read path, never empty-then-populated
     'consistent_db_height': True,
+    # blockchain.sapling.get_mempool serves 0-conf Sapling components
+    'supports_mempool': True,
 }
 PIVX_SAPLING_WITNESS_HELPER_ENV = 'PIVX_SAPLING_WITNESS_HELPER'
 PIVX_SAPLING_WITNESS_HELPER_TIMEOUT_ENV = (
@@ -2162,6 +2166,9 @@ class PIVXSaplingElectrumX(ElectrumX):
         'blockchain.sapling.get_active_heights': [
             'sapling.get_active_heights',
         ],
+        'blockchain.sapling.get_mempool': [
+            'sapling.get_mempool',
+        ],
         'blockchain.sapling.get_nullifier_status': [
             'blockchain.sapling.check_nullifier',
             'sapling.get_nullifier_status',
@@ -2194,6 +2201,7 @@ class PIVXSaplingElectrumX(ElectrumX):
         'blockchain.sapling.capabilities',
         'blockchain.sapling.get_block_range',
         'blockchain.sapling.get_active_heights',
+        'blockchain.sapling.get_mempool',
         'blockchain.sapling.get_nullifier_status',
         'blockchain.sapling.check_nullifiers',
         'blockchain.sapling.get_commitment_info',
@@ -2257,6 +2265,10 @@ class PIVXSaplingElectrumX(ElectrumX):
                 self.sapling_get_active_heights,
             'sapling.get_active_heights':
                 self.sapling_get_active_heights,
+            'blockchain.sapling.get_mempool':
+                self.sapling_get_mempool,
+            'sapling.get_mempool':
+                self.sapling_get_mempool,
             # Additional utility methods
             'blockchain.commitment.get_info':
                 self.commitment_get_info,
@@ -2919,6 +2931,80 @@ class PIVXSaplingElectrumX(ElectrumX):
         if not complete:
             response['end'] = heights[-1]
         return response
+
+    async def sapling_get_mempool(self):
+        '''Sapling components of unconfirmed mempool txs, for 0-conf
+        trial decryption (modeled on lightwalletd GetMempoolStream).
+
+        Same byte-order contract as get_block_range: 32-byte fields in
+        display order, ciphertexts as raw wire bytes.  Mempool outputs
+        have NO tree position and no consensus anchor — deliberately no
+        position/index fields and no witness validation; the client
+        renders decrypted notes as "incoming, not spendable" until the
+        tx appears at a real height in get_block_range.
+        '''
+        mempool = getattr(self, 'mempool', None)
+        not_ready = mempool is None or self._sapling_index_status()['ready'] is False
+        if not_ready:
+            return {
+                'txs': [],
+                'truncated': False,
+                'error': {
+                    'type': 'mempool_not_ready',
+                    'message': 'mempool snapshot is not available yet',
+                    'retryable': True,
+                },
+            }
+
+        self.bump_cost(1.0)
+        txs = []
+        truncated = False
+        total_outputs = 0
+        # No awaits inside the loop, so the dict cannot mutate mid-
+        # iteration.  The view may still reflect an in-progress refresh
+        # (mined txs removed, new ones not yet accepted) — snapshot
+        # semantics; the client polls and dedups by txid + cmu.
+        for tx_hash, tx in mempool.txs.items():
+            sapling = tx.sapling
+            if sapling is None:
+                continue
+            first_seen, spends, outputs = sapling
+            if (len(txs) >= PIVX_SAPLING_MEMPOOL_MAX_TXS
+                    or total_outputs + len(outputs)
+                    > PIVX_SAPLING_MEMPOOL_MAX_OUTPUTS):
+                truncated = True
+                break
+            to_display = self._sapling_raw_to_display
+            output_items = []
+            for output in outputs:
+                epk_hex = to_display(output.ephemeral_key)
+                output_items.append({
+                    'cmu': to_display(output.cmu),
+                    'epk': epk_hex,
+                    'ephemeral_key': epk_hex,
+                    'cv': to_display(output.cv),
+                    'ciphertext': output.enc_ciphertext.hex(),
+                    'enc_ciphertext': output.enc_ciphertext.hex(),
+                    'out_ciphertext': output.out_ciphertext.hex(),
+                })
+            spend_items = [
+                {
+                    'nullifier': to_display(spend.nullifier),
+                    'cv': to_display(spend.cv),
+                    'anchor': to_display(spend.anchor),
+                    'rk': to_display(spend.rk),
+                }
+                for spend in spends
+            ]
+            total_outputs += len(outputs)
+            txs.append({
+                'txid': hash_to_hex_str(tx_hash),
+                'first_seen': first_seen,
+                'outputs': output_items,
+                'spends': spend_items,
+            })
+        self.bump_cost(len(txs) * 0.05 + total_outputs * 0.01)
+        return {'txs': txs, 'truncated': truncated}
 
     async def sapling_get_outputs(
             self,
