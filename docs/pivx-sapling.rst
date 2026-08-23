@@ -53,9 +53,12 @@ Receiving Shielded Funds
 
 Light wallets can scan for incoming shielded transactions using trial decryption:
 
-1. Call ``blockchain.sapling.get_block_range`` to fetch compact blocks
-2. Trial decrypt outputs using viewing keys
-3. Detect owned notes and calculate balance
+1. Call ``blockchain.sapling.get_active_heights`` to learn which
+   blocks contain Sapling activity (skip the rest)
+2. Call ``blockchain.sapling.get_block_range`` to fetch those compact
+   blocks
+3. Trial decrypt outputs using viewing keys
+4. Detect owned notes and calculate balance
 
 Detecting Spent Notes
 ~~~~~~~~~~~~~~~~~~~~
@@ -173,6 +176,8 @@ Production v1 method surface:
      - ``blockchain.sapling.get_capabilities``, ``server.sapling.capabilities``, ``sapling.capabilities``, ``get_capabilities``
    * - ``blockchain.sapling.get_block_range``
      - ``blockchain.sapling.get_blocks``, ``sapling.get_block_range``, ``get_block_range``
+   * - ``blockchain.sapling.get_active_heights``
+     - ``sapling.get_active_heights``
    * - ``blockchain.sapling.get_nullifier_status``
      - ``blockchain.sapling.check_nullifier``, ``sapling.get_nullifier_status``
    * - ``blockchain.sapling.check_nullifiers``
@@ -349,6 +354,57 @@ stale local state after reorgs.
                    check_nullifier(spend['nullifier'])
 
        start = end + 1
+
+blockchain.sapling.get_active_heights
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Return the heights in ``[start_height, end_height]`` that contain at
+least one Sapling spend or output -- exactly the set of blocks
+``get_block_range`` reports non-empty.  PIVX shielded activity is
+sparse, so a restoring wallet should fetch this first and call
+``get_block_range`` only for the returned heights instead of scanning
+every 100-block window.
+
+Feature-detect via ``capabilities.supports_active_height_index`` and
+fall back to plain range scanning when absent.
+
+**Params:** ``start_height`` (required), ``end_height`` (optional,
+defaults to ``start_height``), ``limit`` (optional, default 10000,
+capped at ``capabilities.active_heights_max_limit`` = 50000).
+
+**Result:**
+
+.. code-block:: python
+
+   {
+       'heights': [2700501, 2700734],  # ascending, plain ints
+       'start': 2700500,
+       'end': 3200000,        # last height actually covered
+       'complete': True,
+       'db_height': 5552849,  # the server's indexed tip
+   }
+
+Semantics:
+
+- The range is clamped to the indexed tip: ``end`` is
+  ``min(end_height, db_height)`` and requests entirely above the tip
+  return ``heights: [], complete: true`` -- unlike ``get_block_range``
+  this is not an error, so a client polling at the tip needs no special
+  casing.
+- If more than ``limit`` heights match, the first ``limit`` are
+  returned with ``complete: false`` and ``end`` set to the last
+  returned height; resume the scan at ``end + 1``.  Paging is
+  deterministic.
+- If the index trails the daemon past its tolerance the response
+  carries the same retryable ``index_not_ready`` error object
+  ``get_block_range`` uses (with ``complete: false``); partial results
+  are never served in that state.
+- Heights are plain JSON integers; ``hex_byte_order`` does not apply.
+
+The index is maintained atomically with the rest of the Sapling index
+and is rebuilt automatically (one-time, from the existing
+commitment/nullifier indexes) when a server synced before this method
+existed restarts -- no resync is required.
 
 blockchain.sapling.get_outputs
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

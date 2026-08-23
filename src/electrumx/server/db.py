@@ -654,6 +654,8 @@ class DB:
             self.wall_time = 0
             self.first_sync = True
             self.sapling_output_count = 0
+            # A fresh DB maintains the active-height index from genesis
+            self.sapling_active_heights_built = True
         else:
             state = ast.literal_eval(state.decode())
             if not isinstance(state, dict):
@@ -689,6 +691,10 @@ class DB:
                         f'index version {index_version} but this software '
                         f'requires version {self.SAPLING_INDEX_VERSION}; '
                         f'resync from genesis to rebuild the Sapling index')
+            self.sapling_active_heights_built = state.get(
+                'sapling_active_heights_built', False)
+            if not self.sapling_active_heights_built:
+                self._backfill_sapling_active_heights()
 
         # These are our state as we move ahead of DB state
         self.fs_height = self.db_height
@@ -810,6 +816,7 @@ class DB:
             'db_version': self.db_version,
             'sapling_output_count': self.sapling_output_count,
             'sapling_index_version': self.SAPLING_INDEX_VERSION,
+            'sapling_active_heights_built': self.sapling_active_heights_built,
         }
         batch.put(b'state', repr(state).encode())
 
@@ -902,6 +909,9 @@ class DB:
     # b'P' + position (8, BE) -> tx_hash (32) + output_index (2, BE)
     #                            + height (4, BE) + commitment (32)
     # b'A' + root (32 bytes) -> first_height (4, BE) + tree_size (8, BE)
+    # b'S' + height (4, BE) -> b'' (height has >= 1 Sapling spend or
+    #                          output; the set get_block_range reports
+    #                          non-empty)
     #
     # b'A' entries index the consensus finalsaplingroot from PIVX v8+
     # block headers (bytes 80:112, raw little-endian serialization
@@ -915,6 +925,10 @@ class DB:
     @staticmethod
     def sapling_position_key(position: int) -> bytes:
         return b'P' + position.to_bytes(8, 'big')
+
+    @staticmethod
+    def sapling_active_height_key(height: int) -> bytes:
+        return b'S' + pack_be_uint32(height)
 
     def flush_sapling_data(
             self,
@@ -944,6 +958,10 @@ class DB:
                     + pack_be_uint32(height))
             batch_put(b'C' + commitment, meta + position.to_bytes(8, 'big'))
             batch_put(self.sapling_position_key(position), meta + commitment)
+
+        for height in {item[2] for item in nullifiers}.union(
+                item[3] for item in commitments):
+            batch_put(self.sapling_active_height_key(height), b'')
 
         # First-seen semantics: after a restart the first block's root
         # may already be indexed; don't overwrite the earlier height.
@@ -981,6 +999,10 @@ class DB:
         if height_start is not None:
             for key, value in self.utxo_db.iterator(prefix=b'A'):
                 height, = unpack_be_uint32(value[:4])
+                if height >= height_start:
+                    batch_delete(key)
+            for key, _value in self.utxo_db.iterator(prefix=b'S'):
+                height, = unpack_be_uint32(key[1:5])
                 if height >= height_start:
                     batch_delete(key)
 
@@ -1057,6 +1079,52 @@ class DB:
         '''Return the first height a Sapling root appeared at, or None.'''
         info = self.get_sapling_anchor_info(root)
         return None if info is None else info[0]
+
+    def get_sapling_active_heights(
+            self, start_height: int, end_height: int, limit: int
+    ) -> Tuple[List[int], bool]:
+        '''Return (heights, complete): ascending heights in
+        [start_height, end_height] with at least one Sapling spend or
+        output, at most limit entries.  complete is False when more
+        matching heights exist beyond the last one returned.
+        '''
+        # ponytail: scans active heights below start_height too; fine
+        # while shielded activity is sparse, add a seekable iterator if
+        # the b'S' index ever grows into the millions
+        heights = []
+        complete = True
+        for key, _value in self.utxo_db.iterator(prefix=b'S'):
+            height, = unpack_be_uint32(key[1:5])
+            if height < start_height:
+                continue
+            if height > end_height:
+                break
+            if len(heights) >= limit:
+                complete = False
+                break
+            heights.append(height)
+        return heights, complete
+
+    def _backfill_sapling_active_heights(self):
+        '''One-time build of the b'S' index from the heights already
+        stored in the b'P' (outputs) and b'N' (spends) indexes, so DBs
+        synced before this index existed need no resync.'''
+        start = time.time()
+        heights = set()
+        for _key, value in self.utxo_db.iterator(prefix=b'P'):
+            height, = unpack_be_uint32(value[34:38])
+            heights.add(height)
+        for _key, value in self.utxo_db.iterator(prefix=b'N'):
+            height, = unpack_be_uint32(value[32:36])
+            heights.add(height)
+        with self.utxo_db.write_batch() as batch:
+            for height in heights:
+                batch.put(self.sapling_active_height_key(height), b'')
+            self.sapling_active_heights_built = True
+            self.write_utxo_state(batch)
+        self.logger.info(f'built Sapling active-height index: '
+                         f'{len(heights):,d} heights '
+                         f'in {time.time() - start:.1f}s')
 
     def get_sapling_root(self, height: int) -> Optional[bytes]:
         '''Return the raw finalsaplingroot bytes from the header at height.

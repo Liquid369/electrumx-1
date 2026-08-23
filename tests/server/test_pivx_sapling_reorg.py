@@ -12,7 +12,9 @@ Conventions under test:
   anchors and fail closed on mismatch
 '''
 
+import ast
 import asyncio
+import contextlib
 import json
 import logging
 from collections import defaultdict
@@ -70,6 +72,10 @@ class FakeKV:
                  if key.startswith(prefix)]
         return iter(sorted(items, reverse=reverse))
 
+    def write_batch(self):
+        # put/delete already match the batch interface
+        return contextlib.nullcontext(self)
+
 
 HEADER_SPACING = 1000
 
@@ -101,6 +107,7 @@ def make_sapling_db(blocks=()):
     db.wall_time = 0
     db.first_sync = False
     db.sapling_output_count = 0
+    db.sapling_active_heights_built = True
 
     hashes = {}
     headers = {}
@@ -2073,3 +2080,239 @@ def test_live_helper_methods_do_not_leak_internal_errors(monkeypatch):
     assert best_anchor['block_hash'] == block['hash']
     assert nullifier_status['spent'] is False
     assert commitment_info['exists'] is False
+
+
+# ---------------------------------------------------------------------------
+# Active-height index (blockchain.sapling.get_active_heights)
+# ---------------------------------------------------------------------------
+
+def _flush_activity(db, spends=(), outputs=()):
+    '''Flush spend/output activity at the given heights.'''
+    nullifiers = [(asym32(0xA0, h & 0xFF), b'\2' * 32, h, 0) for h in spends]
+    commitments = [(asym32(0xB0, h & 0xFF), b'\3' * 32, 0, h, pos)
+                   for pos, h in enumerate(outputs)]
+    db.flush_sapling_data(db.utxo_db, nullifiers, commitments, [])
+
+
+def test_flush_sapling_data_records_active_heights():
+    db = make_sapling_db()
+    _flush_activity(db, spends=[7], outputs=[5, 7])
+
+    heights, complete = db.get_sapling_active_heights(0, 100, 10)
+
+    assert heights == [5, 7]
+    assert complete is True
+
+
+def test_active_heights_query_clamps_to_requested_range():
+    db = make_sapling_db()
+    _flush_activity(db, outputs=[5, 10, 20, 30])
+
+    heights, complete = db.get_sapling_active_heights(10, 20, 10)
+
+    assert heights == [10, 20]
+    assert complete is True
+
+
+def test_active_heights_pages_deterministically():
+    db = make_sapling_db()
+    _flush_activity(db, outputs=[10, 20, 30, 40, 50])
+
+    first = db.get_sapling_active_heights(10, 50, 2)
+    assert first == ([10, 20], False)
+    second = db.get_sapling_active_heights(21, 50, 2)
+    assert second == ([30, 40], False)
+    third = db.get_sapling_active_heights(41, 50, 2)
+    assert third == ([50], True)
+
+
+def test_active_heights_exact_limit_is_complete():
+    db = make_sapling_db()
+    _flush_activity(db, outputs=[10, 20])
+
+    assert db.get_sapling_active_heights(0, 100, 2) == ([10, 20], True)
+
+
+def test_backup_sapling_data_purges_active_heights():
+    db = make_sapling_db()
+    _flush_activity(db, spends=[5, 6], outputs=[7])
+
+    db.backup_sapling_data(db.utxo_db, [], [], height_start=6)
+
+    assert db.get_sapling_active_heights(0, 100, 10) == ([5], True)
+
+
+def test_backfill_builds_active_heights_from_existing_indexes():
+    db = make_sapling_db()
+    _flush_activity(db, spends=[6], outputs=[5, 8])
+    # Simulate a DB synced before the b'S' index existed
+    for key in [k for k in db.utxo_db.data if k.startswith(b'S')]:
+        db.utxo_db.delete(key)
+    db.sapling_active_heights_built = False
+    assert db.get_sapling_active_heights(0, 100, 10) == ([], True)
+
+    db._backfill_sapling_active_heights()
+
+    assert db.get_sapling_active_heights(0, 100, 10) == ([5, 6, 8], True)
+    assert db.sapling_active_heights_built is True
+    state = ast.literal_eval(db.utxo_db.get(b'state').decode())
+    assert state['sapling_active_heights_built'] is True
+
+
+def test_read_utxo_state_backfills_active_heights_once():
+    db = make_sapling_db()
+    _flush_activity(db, spends=[6], outputs=[5])
+    for key in [k for k in db.utxo_db.data if k.startswith(b'S')]:
+        db.utxo_db.delete(key)
+    state = _utxo_state(sapling_index_version=DB.SAPLING_INDEX_VERSION)
+    assert 'sapling_active_heights_built' not in state
+    db.utxo_db.put(b'state', repr(state).encode())
+
+    db.read_utxo_state()
+
+    assert db.get_sapling_active_heights(0, 100, 10) == ([5, 6], True)
+    # A later restart must not rebuild: remove one key and re-read
+    db.utxo_db.delete(DB.sapling_active_height_key(5))
+    db.read_utxo_state()
+    assert db.get_sapling_active_heights(0, 100, 10) == ([6], True)
+
+
+def test_write_utxo_state_stamps_active_heights_marker():
+    db = make_sapling_db()
+    db.write_utxo_state(db.utxo_db)
+
+    state = ast.literal_eval(db.utxo_db.get(b'state').decode())
+    assert state['sapling_active_heights_built'] is True
+
+
+def test_get_active_heights_rpc_envelope_and_clamp():
+    db = make_sapling_db()
+    db.db_height = 100
+    _flush_activity(db, spends=[40], outputs=[20, 90])
+    session = make_session(db, FixtureDaemon([]))
+
+    response = run(session.sapling_get_active_heights(10, 500, 10))
+
+    assert response == {
+        'heights': [20, 40, 90],
+        'start': 10,
+        'end': 100,  # clamped to db_height, not an error
+        'complete': True,
+        'db_height': 100,
+    }
+
+
+def test_get_active_heights_rpc_empty_range_is_complete():
+    db = make_sapling_db()
+    db.db_height = 100
+    session = make_session(db, FixtureDaemon([]))
+
+    response = run(session.sapling_get_active_heights(10, 50))
+
+    assert response['heights'] == []
+    assert response['complete'] is True
+    assert response['end'] == 50
+
+
+def test_get_active_heights_rpc_above_tip_is_empty_and_complete():
+    db = make_sapling_db()
+    db.db_height = 100
+    _flush_activity(db, outputs=[90])
+    session = make_session(db, FixtureDaemon([]))
+
+    response = run(session.sapling_get_active_heights(101, 200, 10))
+
+    assert response['heights'] == []
+    assert response['complete'] is True
+    assert response['end'] == 100
+    assert response['db_height'] == 100
+
+
+def test_get_active_heights_rpc_truncation_sets_resume_end():
+    db = make_sapling_db()
+    db.db_height = 100
+    _flush_activity(db, outputs=[10, 20, 30, 40, 50])
+    session = make_session(db, FixtureDaemon([]))
+
+    first = run(session.sapling_get_active_heights(0, 100, 2))
+    assert first['heights'] == [10, 20]
+    assert first['complete'] is False
+    assert first['end'] == 20
+
+    resumed = run(session.sapling_get_active_heights(
+        first['end'] + 1, 100, 2))
+    assert resumed['heights'] == [30, 40]
+    assert resumed['complete'] is False
+    assert resumed['end'] == 40
+
+    final = run(session.sapling_get_active_heights(
+        resumed['end'] + 1, 100, 2))
+    assert final['heights'] == [50]
+    assert final['complete'] is True
+    assert final['end'] == 100
+
+
+def test_get_active_heights_rpc_fails_fast_when_index_is_behind_tip():
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db([block])
+    db.db_height = block['height'] - 3
+    session = make_session(
+        db,
+        LaggingDaemon([block], cached_height=block['height']),
+    )
+
+    response = run(session.sapling_get_active_heights(
+        block['height'], block['height']))
+
+    assert response['heights'] == []
+    assert response['complete'] is False
+    assert response['error']['type'] == 'index_not_ready'
+    assert response['error']['retryable'] is True
+
+
+def test_get_active_heights_rpc_rejects_inverted_range():
+    db = make_sapling_db()
+    db.db_height = 100
+    session = make_session(db, FixtureDaemon([]))
+
+    with pytest.raises(RPCError, match='end_height'):
+        run(session.sapling_get_active_heights(50, 10))
+
+
+def test_get_active_heights_matches_get_block_range_emptiness():
+    '''Acceptance: active heights == the heights get_block_range reports
+    non-empty, verified over real mainnet fixture blocks.'''
+    for filename in ('pivx_mainnet_5057529.json', 'pivx_mainnet_10000.json'):
+        block = load_block_fixture(filename)
+        db = make_sapling_db([block])
+        index_block_sapling(db, block)
+        session = make_session(db, FixtureDaemon([block]))
+
+        range_response = run(session.sapling_get_block_range(
+            block['height'], block['height']))
+        assert range_response['success'] is True
+        active = run(session.sapling_get_active_heights(
+            block['height'], block['height']))
+        assert active['complete'] is True
+
+        expected = [] if range_response['empty'] else [block['height']]
+        assert active['heights'] == expected
+
+
+def test_capabilities_advertise_active_height_index(monkeypatch):
+    monkeypatch.delenv(PIVX_SAPLING_WITNESS_HELPER_ENV, raising=False)
+    monkeypatch.setattr('electrumx.server.session.shutil.which',
+                        lambda _name: None)
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db([block])
+    session = make_session(db, FixtureDaemon([block]))
+
+    capabilities = run(session.sapling_capabilities())
+
+    assert capabilities['supports_active_height_index'] is True
+    assert capabilities['active_heights_max_limit'] == 50000
+    assert ('blockchain.sapling.get_active_heights'
+            in capabilities['methods'])
+    assert capabilities['aliases'][
+        'blockchain.sapling.get_active_heights'] == [
+            'sapling.get_active_heights']

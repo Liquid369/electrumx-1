@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 BAD_REQUEST = 1
 DAEMON_ERROR = 2
 PIVX_SAPLING_MAX_BLOCK_RANGE = 100
+PIVX_SAPLING_ACTIVE_HEIGHTS_MAX_LIMIT = 50000
 PIVX_SAPLING_RPC_CONTRACT = 'pivx.sapling.electrumx.v1'
 PIVX_SAPLING_RELEASE_METHODS = [
     'blockchain.sapling.get_block_range',
@@ -2155,6 +2156,9 @@ class PIVXSaplingElectrumX(ElectrumX):
             'get_block_range',
             'sapling.get_block_range',
         ],
+        'blockchain.sapling.get_active_heights': [
+            'sapling.get_active_heights',
+        ],
         'blockchain.sapling.get_nullifier_status': [
             'blockchain.sapling.check_nullifier',
             'sapling.get_nullifier_status',
@@ -2186,6 +2190,7 @@ class PIVXSaplingElectrumX(ElectrumX):
     SAPLING_METHODS = [
         'blockchain.sapling.capabilities',
         'blockchain.sapling.get_block_range',
+        'blockchain.sapling.get_active_heights',
         'blockchain.sapling.get_nullifier_status',
         'blockchain.sapling.check_nullifiers',
         'blockchain.sapling.get_commitment_info',
@@ -2245,6 +2250,10 @@ class PIVXSaplingElectrumX(ElectrumX):
                 self.sapling_get_block_range,
             'sapling.get_block_range':
                 self.sapling_get_block_range,
+            'blockchain.sapling.get_active_heights':
+                self.sapling_get_active_heights,
+            'sapling.get_active_heights':
+                self.sapling_get_active_heights,
             # Additional utility methods
             'blockchain.commitment.get_info':
                 self.commitment_get_info,
@@ -2344,6 +2353,9 @@ class PIVXSaplingElectrumX(ElectrumX):
             'index_status': index_status,
             'hex_byte_order': 'display',
             'consensus_anchors': True,
+            'supports_active_height_index': True,
+            'active_heights_max_limit':
+                PIVX_SAPLING_ACTIVE_HEIGHTS_MAX_LIMIT,
             'range_error_types': [
                 'invalid_range',
                 'daemon_error',
@@ -2825,6 +2837,61 @@ class PIVXSaplingElectrumX(ElectrumX):
     # =========================================================================
     # CAKE WALLET CORE APIs
     # =========================================================================
+
+    async def sapling_get_active_heights(
+            self,
+            start_height: int,
+            end_height: int = None,
+            limit: int = 10000,
+    ):
+        '''Heights in [start_height, end_height] with at least one
+        Sapling spend or output — exactly the set of blocks
+        get_block_range reports non-empty — so clients can skip empty
+        ranges instead of scanning every 100-block window.
+
+        Served from the b'S' height index; the range is clamped to the
+        indexed tip (db_height), never errored for extending above it.
+        When more than limit heights match, the first limit are
+        returned with complete False and end set to the last covered
+        height; resume at end + 1.
+        '''
+        start_height = non_negative_integer(start_height)
+        end_height = (start_height if end_height is None
+                      else non_negative_integer(end_height))
+        if end_height < start_height:
+            raise RPCError(BAD_REQUEST,
+                           'end_height must be >= start_height')
+        limit = max(1, min(non_negative_integer(limit),
+                           PIVX_SAPLING_ACTIVE_HEIGHTS_MAX_LIMIT))
+
+        db_height = self.db.db_height
+        response = {
+            'heights': [],
+            'start': start_height,
+            'end': min(end_height, db_height),
+            'complete': True,
+            'db_height': db_height,
+        }
+        # Same not-ready gate as get_block_range: never a partial
+        # answer while the index trails the daemon past its tolerance
+        index_error = self._sapling_index_not_ready_error(end_height)
+        if index_error is not None:
+            response['complete'] = False
+            response['error'] = index_error
+            return response
+        if start_height > db_height:
+            return response
+
+        self.bump_cost(1.0)
+        heights, complete = await run_in_thread(
+            self.db.get_sapling_active_heights,
+            start_height, min(end_height, db_height), limit)
+        self.bump_cost(len(heights) / 5000)
+        response['heights'] = heights
+        response['complete'] = complete
+        if not complete:
+            response['end'] = heights[-1]
+        return response
 
     async def sapling_get_outputs(
             self,
