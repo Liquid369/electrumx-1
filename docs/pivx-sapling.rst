@@ -36,9 +36,13 @@ Transaction Parsing
   ``Optional<SaplingTxData>``: a one-byte presence flag followed, when
   non-zero, by ``valueBalance``, the shielded spend vector, and the
   shielded output vector.  PIVX has no ``nExpiryHeight`` field.
-* ``bindingSig`` (64 bytes) is serialized only when the shielded spend or
-  output vectors are non-empty; Sapling-version transactions with empty
-  shielded vectors carry none.
+* ``bindingSig`` (64 bytes) is serialized **unconditionally** inside
+  ``SaplingTxData`` (unlike Zcash, which serializes it only for
+  non-empty shielded vectors): a transparent v3 transaction with empty
+  spend/output vectors still carries a 64-byte all-zero signature.
+  Assuming the Zcash rule computes wrong txids from the first v3
+  transparent tx (mainnet regression fixture: ``2d356c83...ff4369`` at
+  height 2,981,155).
 * Special transaction types (PIVX v6.0+) append an
   ``Optional<vector<uint8>>`` ``extraPayload``: a one-byte presence flag
   followed by a compact-size length and the payload bytes.  PIVX v6.0+
@@ -138,7 +142,8 @@ Sapling sync/send routes.  A production-ready server returns (abridged):
        "structured_errors": true,
        "canonical_witnesses": true,
        "consistent_db_height": true,
-       "supports_mempool": true
+       "supports_mempool": true,
+       "supports_mempool_subscribe": true
      },
      "witness_response": "canonical_path",
      "witness_path_length": 32,
@@ -206,6 +211,12 @@ Production v1 method surface:
      - ``sapling.get_active_heights``
    * - ``blockchain.sapling.get_mempool``
      - ``sapling.get_mempool``
+   * - ``blockchain.sapling.get_outputs``
+     - (no aliases)
+   * - ``blockchain.sapling.mempool.subscribe``
+     - ``sapling.mempool.subscribe``
+   * - ``blockchain.sapling.mempool.unsubscribe``
+     - ``sapling.mempool.unsubscribe``
    * - ``blockchain.sapling.get_nullifier_status``
      - ``blockchain.sapling.check_nullifier``, ``sapling.get_nullifier_status``
    * - ``blockchain.sapling.check_nullifiers``
@@ -303,7 +314,9 @@ clients can clamp and retry.
              "output_index": 0,
              "cmu": "a3a5aca5...",
              "epk": "28e5a699...",
+             "ephemeral_key": "28e5a699...",
              "ciphertext": "b76937c4...",
+             "enc_ciphertext": "b76937c4...",
              "cv": "...",
              "out_ciphertext": "..."
            }
@@ -417,8 +430,10 @@ Semantics:
 - The range is clamped to the indexed tip: ``end`` is
   ``min(end_height, db_height)`` and requests entirely above the tip
   return ``heights: [], complete: true`` -- unlike ``get_block_range``
-  this is not an error, so a client polling at the tip needs no special
-  casing.
+  this is not an error.  Exception: while the index trails the daemon
+  past its tolerance (lag > 2), a request extending above the tip
+  returns the retryable ``index_not_ready`` error instead (ranges
+  wholly at or below ``db_height`` are always served).
 - If more than ``limit`` heights match, the first ``limit`` are
   returned with ``complete: false`` and ``end`` set to the last
   returned height; resume the scan at ``end + 1``.  Paging is
@@ -490,6 +505,27 @@ Invariants:
   'retryable': true}}`` — distinguish from a genuinely empty mempool,
   which has no ``error``.
 
+blockchain.sapling.mempool.subscribe
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Push variant of ``get_mempool``.  Subscribing returns the current
+snapshot (exactly the ``get_mempool`` envelope); thereafter the server
+pushes the same envelope as a JSON-RPC notification (method
+``blockchain.sapling.mempool.subscribe``, single parameter) whenever
+the set of Sapling-carrying mempool transactions changes — a tx
+arriving, being mined, or being evicted — or when snapshot
+availability flips (a ``mempool_not_ready`` push is always followed by
+a corrective push once the server recovers, even if the tx set never
+changed).
+
+Notifications are **full state replacements**: apply the latest one;
+there is no delta protocol and nothing to miss.  The subscription
+lasts for the session lifetime or until
+``blockchain.sapling.mempool.unsubscribe`` (returns whether a
+subscription was active).  Feature-detect via
+``features.supports_mempool_subscribe``; fall back to polling
+``get_mempool`` when absent.
+
 blockchain.sapling.get_outputs
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -537,7 +573,9 @@ blockchain.sapling.get_nullifier_status
 Check whether a single Sapling nullifier is indexed as spent.  This is the
 preferred v1 status method for Cake Wallet live helper validation.
 ``blockchain.sapling.check_nullifiers`` accepts a list of up to 10,000
-nullifiers and returns the same status objects keyed by nullifier.
+nullifiers (or ``{"nullifiers": [...]}``) and returns an envelope
+``{"success": true, "contract": ..., "results": {nullifier: status}}``
+with the same status objects keyed by nullifier under ``results``.
 
 **Parameters:**
 
@@ -652,6 +690,11 @@ activity.
      }
    }
 
+When the index trails the daemon past its tolerance the unavailable
+response instead carries the full retryable ``index_not_ready`` error
+object (``type``, ``retryable``, ``db_height``, ``daemon_height``,
+``lag``, ...), and ``block_hash`` is ``null`` in that state.
+
 blockchain.nullifier.get_spend
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -672,7 +715,11 @@ Legacy lookup for the transaction that spent a specific nullifier.  Prefer
      "spend_index": 0
    }
 
-Returns ``null`` when the nullifier is not indexed as spent.
+Returns ``null`` when the nullifier is not indexed as spent.  While
+the index trails the daemon past its tolerance it instead returns a
+**truthy** envelope with ``txid: null`` and a retryable
+``index_not_ready`` ``error`` object -- test ``txid``, never bare
+truthiness (or use ``get_nullifier_status``).
 
 blockchain.sapling.get_witness
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -732,8 +779,10 @@ size must match the value recorded for that anchor.  Any mismatch fails
 the request with ``index_incomplete`` instead of returning an
 internally-consistent but unspendable witness.  Structured witness error
 types are ``witness_backend_unavailable``, ``witness_backend_timeout``,
-``commitment_not_found``, ``invalid_anchor``, ``anchor_not_found``,
-``index_incomplete``, and ``index_not_ready``.
+``witness_backend_error``, ``commitment_not_found``,
+``anchor_not_found``, ``anchor_mismatch``, ``index_incomplete``, and
+``backend_timeout`` (the outer per-request timeout; all surfaced as
+``RPCError`` messages prefixed ``<type>:``).
 
 ``blockchain.sapling.get_witnesses`` accepts a list of up to 100
 positions/commitments plus an optional shared ``anchor_hex`` and returns a
@@ -859,7 +908,7 @@ The ``Pivx`` coin class automatically:
 Database Schema
 ~~~~~~~~~~~~~~~
 
-The Sapling index lives in the UTXO database under four key prefixes
+The Sapling index lives in the UTXO database under five key prefixes
 (all keys and values in raw serialization byte order; display-order
 conversion happens only at the RPC boundary):
 
@@ -871,6 +920,9 @@ conversion happens only at the RPC boundary):
   ``tx_hash (32) + output_index (2, BE) + height (4, BE) + commitment (32)``
 * ``b'A' + root (32)`` ->
   ``first_seen_height (4, BE) + tree_size (8, BE)``
+* ``b'S' + height (4, BE)`` -> ``b''`` (the height carries at least one
+  Sapling spend or output; backs ``get_active_heights`` and is
+  backfilled once at startup on databases synced before it existed)
 
 ``b'A'`` entries index the consensus ``finalsaplingroot`` from PIVX v8+
 block headers (header bytes 80:112, raw little-endian serialization
@@ -1014,6 +1066,8 @@ Server-side reorg behavior:
 * Removed Sapling spends delete their nullifier index entries.
 * Anchors (``b'A'`` roots) first seen at or above the first reverted
   height are deleted; roots first seen earlier remain valid.
+* Active-height entries (``b'S'``) at or above the first reverted
+  height are deleted in the same batch.
 * A nullifier removed by reorg may be indexed again if it is spent on a
   different branch.
 * Global Sapling output positions are rolled back to the first removed
@@ -1187,10 +1241,16 @@ Performance Issues
   cost accounting still applies)
 * **Witness calls are expensive**: each ``get_witness`` invocation feeds
   the full commitment stream to a helper subprocess; keep the helper
-  state file enabled and batch related requests via ``get_witnesses``
+  state file enabled and batch related requests via ``get_witnesses`` (a round-trip
+  convenience only -- each position still runs its own helper
+  invocation)
 * **Request timeouts**: Sapling requests are bounded by
-  ``PIVX_SAPLING_RPC_TIMEOUT`` (default 8s); ``backend_timeout`` errors
-  are retryable
+  ``PIVX_SAPLING_RPC_TIMEOUT`` (default 8s).  Treat any
+  ``backend_timeout`` as retryable: inside ``get_block_range`` it is a
+  structured envelope error with ``retryable: true``; on every other
+  method (and on the outer per-request timeout) it surfaces as a plain
+  ``RPCError`` whose message starts ``backend_timeout:`` -- key on the
+  message prefix
 * **Server load**: Server may be under heavy load, try different server
 
 Additional Resources

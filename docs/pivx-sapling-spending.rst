@@ -154,9 +154,10 @@ Two sources are available.
 
 Batch with ``blockchain.sapling.get_witnesses`` (up to 100 positions per
 call).  Privacy note: the server learns which note positions are being
-spent.  Performance note: server-side witness generation feeds the full
-commitment stream to a helper subprocess per request; cost accounting
-scales with tree size (see `ElectrumX Server Support (Implemented)`_).
+spent.  Performance note: batching is a round-trip convenience, not a
+cost saver -- the server resolves each position with its own helper
+invocation, each shipping the full commitment stream and each charged
+tree-size-scaled cost (see `ElectrumX Server Support (Implemented)`_).
 
 **Source B: Local tree (privacy-preserving)** -- the remainder of this
 phase:
@@ -380,14 +381,17 @@ Phase 7: Broadcast & Monitoring
 
 4. Watch for conflicts (double-spend / reorg)::
 
-    # Monitor nullifiers
+    # Monitor nullifiers.  get_spend returns null while unspent, and
+    # while the server's index lags it returns a truthy envelope whose
+    # txid is null with a retryable index_not_ready error -- always
+    # check txid, never mere truthiness.
     for nullifier in spent_nullifiers:
         conflict = await electrum.request(
             'blockchain.nullifier.get_spend',
             nullifier
         )
 
-        if conflict.txid != our_txid:
+        if conflict and conflict.get('txid') and conflict['txid'] != our_txid:
             # Reorg or conflict detected
             handle_spend_conflict(nullifier, conflict)
 
@@ -854,8 +858,11 @@ Reorg Handling
 
 **Detection**::
 
-    # ElectrumX provides block hashes
-    current_hash = await electrumx.request('blockchain.block.header', height)
+    # ElectrumX provides block hashes via the Sapling APIs
+    # (blockchain.block.header returns raw header hex, NOT a hash)
+    state = await electrumx.request('blockchain.sapling.get_tree_state',
+                                    height)
+    current_hash = state['block_hash']
     stored_hash = db.get_block_hash(height)
 
     if current_hash != stored_hash:
@@ -978,7 +985,9 @@ everything both options need:
 - ``blockchain.sapling.get_block_range``: commitments (with
   index-verified global positions), spends, and per-height block hashes,
   served only from the server's indexed chain (ranges above the indexed
-  tip fail with ``index_incomplete``; max 100 blocks per request)
+  tip fail with ``index_incomplete`` -- or ``index_not_ready`` while the
+  index trails the daemon past its tolerance; both retryable; max 100
+  blocks per request)
 - ``blockchain.sapling.get_witness`` / ``get_witnesses``: anchor-bound
   canonical Sapling witnesses produced by the ``pivx_sapling_witness``
   helper (``contrib/pivx_sapling_witness``) and validated against the
@@ -989,7 +998,10 @@ everything both options need:
   helper-computed and validated against the consensus anchor index
   (existence and tree size)
 - ``blockchain.sapling.get_tree_state``: consensus ``finalsaplingroot``
-  and tree size at any indexed height, served entirely from the index --
+  and tree size, served entirely from the index, for any indexed height
+  at or above Sapling activation whose header root is in the anchor
+  index (below activation -> ``invalid_range``; header without a Sapling
+  root -> ``index_error``; unindexed root -> ``index_incomplete``) --
   this replaces hardcoded checkpoint lists for verifying a locally built
   tree
 - ``blockchain.sapling.get_anchor_height``: first height at which an
@@ -1014,7 +1026,9 @@ This is mitigated by the helper's on-disk incremental Merkle level cache
 (state file), a server-side commitment stream cache rebuilt off the
 event loop and invalidated on reorgs, a server-wide concurrency
 semaphore on helper subprocesses, and per-session cost accounting that
-scales with tree size -- adequate for the current PIVX shielded pool.
+scales with tree size on ``get_witness`` (``get_best_anchor`` charges a
+flat cost; its result is served from the current-anchor cache in the
+common case) -- adequate for the current PIVX shielded pool.
 If the pool grows large, the documented upgrade path is a persistent
 helper process with an incremental append-only protocol.
 
@@ -1294,10 +1308,14 @@ Common Risks (Both Options)
 
 **Double-spend detection**: Malicious server hides nullifier::
 
-    # Mitigation: Check multiple servers
+    # Mitigation: Check multiple servers.  IMPORTANT: get_spend
+    # returns a truthy index_not_ready envelope (txid null) while a
+    # server's index lags -- testing bare truthiness raises a FALSE
+    # AlreadySpentError.  Test txid, or use get_nullifier_status,
+    # which surfaces success/spent explicitly.
     for server in [server_a, server_b, server_c]:
         spent = await server.nullifier.get_spend(nullifier)
-        if spent:
+        if spent and spent.get('txid'):
             raise AlreadySpentError()
 
 **Fee handling**: Transparent fee reveals shielded activity::

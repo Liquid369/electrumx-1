@@ -73,6 +73,8 @@ PIVX_SAPLING_RELEASE_FEATURES = {
     'consistent_db_height': True,
     # blockchain.sapling.get_mempool serves 0-conf Sapling components
     'supports_mempool': True,
+    # blockchain.sapling.mempool.subscribe pushes the same envelope
+    'supports_mempool_subscribe': True,
 }
 PIVX_SAPLING_WITNESS_HELPER_ENV = 'PIVX_SAPLING_WITNESS_HELPER'
 PIVX_SAPLING_WITNESS_HELPER_TIMEOUT_ENV = (
@@ -2169,6 +2171,12 @@ class PIVXSaplingElectrumX(ElectrumX):
         'blockchain.sapling.get_mempool': [
             'sapling.get_mempool',
         ],
+        'blockchain.sapling.mempool.subscribe': [
+            'sapling.mempool.subscribe',
+        ],
+        'blockchain.sapling.mempool.unsubscribe': [
+            'sapling.mempool.unsubscribe',
+        ],
         'blockchain.sapling.get_nullifier_status': [
             'blockchain.sapling.check_nullifier',
             'sapling.get_nullifier_status',
@@ -2202,6 +2210,8 @@ class PIVXSaplingElectrumX(ElectrumX):
         'blockchain.sapling.get_block_range',
         'blockchain.sapling.get_active_heights',
         'blockchain.sapling.get_mempool',
+        'blockchain.sapling.mempool.subscribe',
+        'blockchain.sapling.mempool.unsubscribe',
         'blockchain.sapling.get_nullifier_status',
         'blockchain.sapling.check_nullifiers',
         'blockchain.sapling.get_commitment_info',
@@ -2269,6 +2279,14 @@ class PIVXSaplingElectrumX(ElectrumX):
                 self.sapling_get_mempool,
             'sapling.get_mempool':
                 self.sapling_get_mempool,
+            'blockchain.sapling.mempool.subscribe':
+                self.sapling_mempool_subscribe,
+            'sapling.mempool.subscribe':
+                self.sapling_mempool_subscribe,
+            'blockchain.sapling.mempool.unsubscribe':
+                self.sapling_mempool_unsubscribe,
+            'sapling.mempool.unsubscribe':
+                self.sapling_mempool_unsubscribe,
             # Additional utility methods
             'blockchain.commitment.get_info':
                 self.commitment_get_info,
@@ -2390,14 +2408,16 @@ class PIVXSaplingElectrumX(ElectrumX):
             'witness_path_length': 32,
             'witness_path_order': 'leaf_to_root',
             'witness_path_encoding': 'sapling_node_to_bytes_hex',
+            # Only types the witness paths actually raise
             'witness_error_types': [
                 'witness_backend_unavailable',
                 'witness_backend_timeout',
+                'witness_backend_error',
                 'commitment_not_found',
-                'invalid_anchor',
                 'anchor_not_found',
+                'anchor_mismatch',
                 'index_incomplete',
-                'index_not_ready',
+                'backend_timeout',
             ],
             'methods': self.SAPLING_METHODS,
             'aliases': self.SAPLING_METHOD_ALIASES,
@@ -2932,19 +2952,30 @@ class PIVXSaplingElectrumX(ElectrumX):
             response['end'] = heights[-1]
         return response
 
-    async def sapling_get_mempool(self):
-        '''Sapling components of unconfirmed mempool txs, for 0-conf
-        trial decryption (modeled on lightwalletd GetMempoolStream).
+    # Class defaults: per-session mempool subscription state
+    _sapling_mempool_subscribed = False
+    _sapling_mempool_sent_key = None
 
-        Same byte-order contract as get_block_range: 32-byte fields in
-        display order, ciphertexts as raw wire bytes.  Mempool outputs
-        have NO tree position and no consensus anchor — deliberately no
-        position/index fields and no witness validation; the client
-        renders decrypted notes as "incoming, not spendable" until the
-        tx appears at a real height in get_block_range.
-        '''
+    def _sapling_mempool_key(self):
+        '''Fingerprint of the current Sapling mempool state, or None
+        when no mempool snapshot is available.  Includes readiness so a
+        not_ready push is followed by a corrective push when the index
+        recovers, even if the tx set never changed.'''
         mempool = getattr(self, 'mempool', None)
-        not_ready = mempool is None or self._sapling_index_status()['ready'] is False
+        if mempool is None:
+            return None
+        return (
+            self._sapling_index_status()['ready'],
+            frozenset(tx_hash for tx_hash, tx in mempool.txs.items()
+                      if tx.sapling is not None),
+        )
+
+    def _sapling_mempool_snapshot(self):
+        '''The get_mempool response envelope (shared by the poll method,
+        the subscribe result, and push notifications).'''
+        mempool = getattr(self, 'mempool', None)
+        not_ready = (mempool is None
+                     or self._sapling_index_status()['ready'] is False)
         if not_ready:
             return {
                 'txs': [],
@@ -2955,8 +2986,6 @@ class PIVXSaplingElectrumX(ElectrumX):
                     'retryable': True,
                 },
             }
-
-        self.bump_cost(1.0)
         txs = []
         truncated = False
         total_outputs = 0
@@ -3003,8 +3032,67 @@ class PIVXSaplingElectrumX(ElectrumX):
                 'outputs': output_items,
                 'spends': spend_items,
             })
-        self.bump_cost(len(txs) * 0.05 + total_outputs * 0.01)
         return {'txs': txs, 'truncated': truncated}
+
+    async def sapling_get_mempool(self):
+        '''Sapling components of unconfirmed mempool txs, for 0-conf
+        trial decryption (modeled on lightwalletd GetMempoolStream).
+
+        Same byte-order contract as get_block_range: 32-byte fields in
+        display order, ciphertexts as raw wire bytes.  Mempool outputs
+        have NO tree position and no consensus anchor — deliberately no
+        position/index fields and no witness validation; the client
+        renders decrypted notes as "incoming, not spendable" until the
+        tx appears at a real height in get_block_range.
+        '''
+        self.bump_cost(1.0)
+        snapshot = self._sapling_mempool_snapshot()
+        self.bump_cost(len(snapshot['txs']) * 0.05)
+        return snapshot
+
+    async def sapling_mempool_subscribe(self):
+        '''Subscribe to Sapling mempool changes.  Returns the current
+        snapshot (same envelope as get_mempool); thereafter the same
+        envelope is pushed as a notification whenever the set of
+        Sapling-carrying mempool txs changes.  Notifications are full
+        state replacements — apply the latest one, nothing to diff.'''
+        self.bump_cost(0.5)
+        self._sapling_mempool_subscribed = True
+        self._sapling_mempool_sent_key = self._sapling_mempool_key()
+        return self._sapling_mempool_snapshot()
+
+    async def sapling_mempool_unsubscribe(self):
+        '''Stop Sapling mempool notifications.  Returns whether a
+        subscription was active.'''
+        self.bump_cost(0.1)
+        was_subscribed = self._sapling_mempool_subscribed
+        self._sapling_mempool_subscribed = False
+        self._sapling_mempool_sent_key = None
+        return was_subscribed
+
+    async def _sapling_mempool_maybe_notify(self):
+        '''Push the current snapshot if the Sapling mempool changed
+        since the last send.  Called from the per-refresh notification
+        wave, which fires even when no scripthash was touched — a
+        fully-shielded tx touches no hashX at all.'''
+        if not self._sapling_mempool_subscribed:
+            return
+        # ponytail: O(mempool) key scan per subscribed session per
+        # refresh; move to a session-manager shared cache if subscriber
+        # counts ever make this measurable
+        key = self._sapling_mempool_key()
+        if key == self._sapling_mempool_sent_key:
+            return
+        snapshot = self._sapling_mempool_snapshot()
+        await self.send_notification(
+            'blockchain.sapling.mempool.subscribe', (snapshot,))
+        # Recorded only after a successful send: a failed push is
+        # retried on the next refresh wave instead of being swallowed
+        self._sapling_mempool_sent_key = key
+
+    async def _notify_inner(self, touched, height_changed):
+        await super()._notify_inner(touched, height_changed)
+        await self._sapling_mempool_maybe_notify()
 
     async def sapling_get_outputs(
             self,
@@ -3370,13 +3458,15 @@ class PIVXSaplingElectrumX(ElectrumX):
                 position, 'commitment')
             info = self.db.get_commitment_position_info(requested_commitment)
             if info is None:
-                raise RPCError(BAD_REQUEST, 'commitment not found')
+                raise RPCError(BAD_REQUEST,
+                               'commitment_not_found: commitment not found')
             tx_hash, output_index, note_height, position = info
         else:
             position = non_negative_integer(position)
             output_info = self.db.get_sapling_output_by_position(position)
             if output_info is None:
-                raise RPCError(BAD_REQUEST, 'commitment not found')
+                raise RPCError(BAD_REQUEST,
+                               'commitment_not_found: commitment not found')
             (requested_commitment, tx_hash, output_index, note_height,
              _position) = output_info
 
@@ -3725,10 +3815,11 @@ class PIVXSaplingElectrumX(ElectrumX):
         anchor = self._sapling_display_to_raw(anchor_hex, 'anchor')
         return await run_in_thread(self.db.get_anchor_height, anchor)
 
-    async def transaction_get_sapling(self, tx_hash_hex: str, verbose=False):
+    async def transaction_get_sapling(self, txid: str, verbose=False):
         '''Get Sapling transaction details.
 
-        tx_hash_hex: transaction hash as hex string
+        txid: transaction hash as hex string (display order); the
+        parameter is named txid so named-params calls match the docs
         verbose: if True, include full Sapling component data
 
         Returns transaction with Sapling details if it's a Sapling tx.
@@ -3738,15 +3829,15 @@ class PIVXSaplingElectrumX(ElectrumX):
         self.bump_cost(1.0)
 
         # Validate tx hash
-        assert_tx_hash(tx_hash_hex)
+        assert_tx_hash(txid)
 
         # Get raw transaction from daemon
         try:
             raw_tx_hex = await self.daemon_request(
-                'getrawtransaction', tx_hash_hex, False
+                'getrawtransaction', txid, False
             )
         except DaemonError:
-            raise RPCError(BAD_REQUEST, f'tx not found: {tx_hash_hex}')
+            raise RPCError(BAD_REQUEST, f'tx not found: {txid}')
 
         # Deserialize the transaction
         raw_tx = bytes.fromhex(raw_tx_hex)
@@ -3754,7 +3845,7 @@ class PIVXSaplingElectrumX(ElectrumX):
         tx = deserializer.read_tx()
 
         result = {
-            'txid': tx_hash_hex,
+            'txid': txid,
             'is_sapling': isinstance(tx, TxPIVXSapling),
         }
 

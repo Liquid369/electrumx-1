@@ -1,137 +1,138 @@
 # ElectrumX → Cake Wallet handoff (PIVX Sapling v1 contract)
 
-Date: 2026-07-11
-Server repo: `Liquid369/electrumx-1`, branch `master`, commit `8eca3fc`
+Last updated: 2026-08-24
+Server repo: `Liquid369/electrumx-1`, branch `master`
 (modern spesmilo/electrumx fork; the old `PIVX-Project/electrumx`
 lib/server-layout fork is deprecated, reference only).
 Authoritative contract docs: `docs/pivx-sapling.rst` and
-`docs/pivx-sapling-spending.rst` in the server repo (rewritten and
-code-verified on this date after a three-round audit plus a live
-mainnet resync fix).
+`docs/pivx-sapling-spending.rst` in the server repo — this file is the
+wallet-facing summary of breaking changes and new capabilities.
 
 ## Status
 
-The server passed a 3-round adversarial audit (two independent
-reviewers per round). A live mainnet resync exposed one further
-consensus bug (PIVX serializes SaplingTxData's 64-byte `bindingSig`
-unconditionally, unlike Zcash) — fixed in `8eca3fc` with the real
-mainnet tx `2d356c83…ff4369` as a regression fixture. The reference
-node is resyncing from genesis; wallet integration testing can start
-once it reaches the daemon tip. Activation heights confirmed from PIVX
+Deployed and serving on both default nodes
+(`electrum01.chainster.org`, `electrum02.chainster.org`), fully synced.
+The server passed a 3-round adversarial audit plus per-feature Codex
+audits; 117+ Sapling tests.  Activation heights confirmed from PIVX
 Core v5.6.1: mainnet `2700500`, testnet `201`.
 
-## Breaking changes the wallet MUST adapt to
+## Contract summary (what to feature-detect)
 
-1. **Hex byte order is now `display` everywhere.** Every 32-byte
-   uint256-like value in params AND responses — `cmu`, `nullifier`,
-   `anchor`/`root`, `cv`, `rk`, `epk`/`ephemeral_key`, txids, block
-   hashes — uses PIVX Core RPC display order (`uint256::GetHex`).
-   Earlier server builds emitted raw serialization order for several of
-   these. Feature-detect via `capabilities.hex_byte_order == 'display'`.
-   The ONLY exception: witness `path` elements are raw Sapling node
-   encodings (`witness_path_encoding: 'sapling_node_to_bytes_hex'`),
-   fed directly to the prover.
-   Ciphertexts (`enc_ciphertext`, `out_ciphertext`) are natural-order
-   byte vectors, unchanged.
+Probe `blockchain.sapling.capabilities`.  Current advertisements:
 
-2. **`blockchain.sapling.get_nullifiers` is removed.** Calls return a
-   structured `unsupported_method` envelope. Derive spend information
-   from the `spends` arrays in `get_block_range` (each entry:
-   `nullifier`, `cv`, `anchor`, `rk`, `spend_index`, display order).
-   Single/batch status lookups remain: `get_nullifier_status` /
-   `check_nullifiers` (batch limit 10000).
+- `contract: "pivx.sapling.electrumx.v1"`, `version: 1`,
+  `release_contract_ready: true` when everything below holds.
+- `hex_byte_order: "display"` — every 32-byte value in params and
+  responses (cmu, nullifier, anchor/root, cv, rk, epk, txids, block
+  hashes) uses PIVX Core display order (`uint256::GetHex`).  ONLY
+  exception: witness `path` elements are raw Sapling node encodings.
+  Ciphertexts are natural-order byte vectors, never reversed.
+  Client rule: 32 bytes of hex → reverse before crypto
+  (`from_bytes(reverse(hex_decode(x)))`); anything else as-is.
+- `supports_active_height_index: true` + `active_heights_max_limit`.
+- `features`:
+  - `global_output_positions`, `block_hashes`, `structured_errors` —
+    v1 baseline.
+  - `canonical_witnesses` — true only when the operator deployed the
+    Rust witness helper; gate shielded sends on it.
+  - `consistent_db_height` — db_height is a committed watermark (see
+    below).
+  - `supports_mempool`, `supports_mempool_subscribe` — 0-conf feed.
 
-3. **Ranges above the server's indexed tip are rejected, not empty.**
-   `get_block_range` returns `success:false, complete:false` with
-   `error.type == 'index_incomplete'` and `error.indexed_height`.
-   Treat as retryable (matches the wallet's existing "failed ranges are
-   hard failures" rule). Max range is 100 blocks. `block_hashes` still
-   covers every scanned height for reorg detection. Removed error
-   types: `missing_block_hash`, `partial_index`, `pruned_range`;
-   current list is in `capabilities.range_error_types`.
+## Sync flow (recommended)
 
-4. **`get_tree_state` changed shape.** Served entirely from the
-   server's index (no daemon calls, no scans). Success fields:
-   `anchor`/`root`/`latest_anchor` (display hex of the consensus
-   `finalsaplingroot` from the block header), `tree_size`,
-   `commitment_count` (== tree_size), `anchor_first_height`,
-   `block_hash`, `indexed_height`, `sapling_activation_height`.
-   `nullifier_count` no longer exists. Structured errors:
-   `index_incomplete` (above tip), `invalid_range` (below activation),
-   `index_error`.
+1. `blockchain.sapling.get_active_heights(start, end, limit)` — the
+   heights in range with ≥1 Sapling tx (exactly the blocks
+   `get_block_range` reports non-empty).  Clamps to the indexed tip:
+   above-tip requests return `heights: [], complete: true` — not an
+   error — except while the server trails its daemon past tolerance
+   (lag > 2), when they return retryable `index_not_ready`.  Truncation: first `limit` heights, `complete: false`,
+   `end` = last covered height; resume at `end + 1`.  Cuts a fresh
+   restore from ~28,500 range calls to a handful.
+2. `blockchain.sapling.get_block_range(a, b)` (≤ 100 blocks) only for
+   the active heights.  Envelope semantics unchanged; every output
+   carries its explicit global position; `block_hashes` covers every
+   scanned height for reorg detection.
+3. Confirmations from `index_status.daemon_height`; shield-scan
+   ceiling from `db_height`.
 
-5. **Version negotiation is enforced again.** The wallet may send
-   Sapling-prefixed methods (`blockchain.sapling.*`, `sapling.*`,
-   `blockchain.nullifier/commitment/anchor.*`) plus `server.features`,
-   `server.ping`, `server.banner`, `get_capabilities`,
-   `get_block_range` before `server.version`. Any other method before
-   `server.version` disconnects the session. Send `server.version`
-   early as normal Electrum clients do.
+## db_height is a committed watermark (`consistent_db_height`)
 
-## Witnesses: now real, consensus-validated, fail-closed
+For any `X <= db_height`, every Sapling read path already serves X's
+final committed data — no "empty now, populated later" window.  The
+wallet may scan exactly up to `db_height` and advance its cursor with
+no safety margin (drop the stay-behind workaround when the flag is
+present).  Mid-request reorgs on the two feeds without block hashes
+(`get_active_heights`, `get_outputs`) fail with retryable
+`index_incomplete` instead of silently omitting data; keep the
+standard reorg rescan policy (`REORG_LIMIT = 100`, compare persisted
+per-height hashes against `block_hashes`).
 
-- `get_witness` (and `get_witnesses`, batch ≤ 100) returns canonical
-  Sapling witnesses computed by a Rust helper using real
-  `zcash_primitives` Pedersen hashing (depth 32).
-- Every witness/best-anchor response is validated server-side against
-  consensus anchors indexed from block headers (root existence AND
-  tree-size match) and **fails closed** — the wallet will never receive
-  an internally-consistent-but-unspendable witness silently.
-- Requested anchors (display hex) must be consensus
-  `finalsaplingroot` values of the indexed chain; junk anchors are
-  rejected before any computation.
-- Response fields: `anchor`/`root` (display), `anchor_height`,
-  `tree_size`, `position`/`global_position`, `cmu` (display), `txid`,
-  `output_index`, `path` (32 raw nodes, `path_order: 'leaf_to_root'`).
-  `position` may be passed as an int or a display-hex cmu.
-- `capabilities.canonical_witnesses` is `true` only when the server
-  operator deployed the helper binary; without it, witness calls
-  return structured `witness_backend_unavailable` and
-  `get_best_anchor` returns `canonical_anchor_unavailable`. Gate
-  shielded sends on this flag (it replaces the older
-  `anchor_bound_witnesses` concept).
-- Performance note: witness calls are cost-accounted proportionally to
-  tree size and concurrency-limited server-side. The wallet's existing
-  design (build the commitment tree locally from `get_block_range`
-  global positions, verify against `get_tree_state` anchors) remains
-  the preferred primary path; server witnesses are a
-  verification/fallback source. Sapling RPCs carry a server-side ~8s
-  timeout surfaced as `backend_timeout` structured errors — retryable.
+## 0-conf shielded visibility (mempool)
 
-## Unchanged / confirmed
+- `blockchain.sapling.get_mempool` (poll): `{txs: [{txid, first_seen,
+  outputs, spends}], truncated}` — outputs/spends byte-identical to the
+  same tx's later `get_block_range` appearance (dedup by txid + cmu).
+  Deliberately NO position/index fields: render decrypted notes
+  "incoming, not spendable" until mined.  Caps 1000 txs / 10000
+  outputs, `truncated: true` when hit.  `mempool_not_ready` error
+  envelope (retryable) when no snapshot is available — distinct from a
+  healthy empty mempool (no `error` key).
+- `blockchain.sapling.mempool.subscribe` (push): returns the current
+  snapshot, then pushes the same envelope as a notification whenever
+  the Sapling mempool set changes (or availability flips).  Full state
+  replacement — apply the latest, nothing to diff.
+  `blockchain.sapling.mempool.unsubscribe` to stop.  Spends (nullifiers) are included, so
+  own outgoing sends can show pending instantly.
 
-- Contract id `pivx.sapling.electrumx.v1`; probe
-  `blockchain.sapling.capabilities` (aliases unchanged).
-- `get_block_range` envelope semantics: `success`/`complete`/`empty`
-  distinction, structured errors, ascending heights, canonical
-  block/tx/vShieldOutput ordering, explicit global output positions on
-  every output (now guaranteed — the server errors rather than serving
-  an output without its position).
-- `check_nullifiers` envelope, `get_commitment_info`,
-  `get_anchor_height`, `blockchain.transaction.get_sapling`.
-- `get_outputs` (trial-decryption feed) now advertised in `methods`;
-  range ≤ 100 blocks, ≤ indexed tip, output `limit` ≤ 10000.
-- Reorg policy: `REORG_LIMIT = 100`; rescan `max(activation,
-  last_scanned - 99)` comparing persisted per-height hashes against
-  `block_hashes` — unchanged.
-- Responses are always served from the server's indexed chain (never a
-  diverging daemon tip), so `block_hashes` are self-consistent with
-  positions and anchors within a response.
+## Breaking changes vs pre-audit servers (unchanged from July)
 
-## Wallet-side action list
+1. Hex byte order is display everywhere (feature-detect, see above).
+2. `blockchain.sapling.get_nullifiers` is removed → structured
+   `unsupported_method`; derive spends from `get_block_range` `spends`
+   arrays; `get_nullifier_status` / `check_nullifiers` (batch ≤ 10000)
+   remain.
+3. Ranges above the indexed tip are rejected (`index_incomplete` with
+   `error.indexed_height`), not empty — except `get_active_heights`,
+   which clamps (see above).
+4. `get_tree_state` serves from the index: `anchor`/`root`/
+   `latest_anchor` (display), `tree_size`, `commitment_count`,
+   `anchor_first_height`, `block_hash`, `indexed_height`,
+   `sapling_activation_height`; `nullifier_count` no longer exists.
+5. Version negotiation enforced with a pre-`server.version` whitelist
+   (all `blockchain.sapling.*`/`sapling.*` methods plus
+   `server.features`, `server.ping`, `server.banner`,
+   `get_capabilities`, `get_block_range`).  Send `server.version`
+   early.
 
-1. Normalize all 32-byte hex handling to display order, gated on
-   `hex_byte_order`.
-2. Replace any `get_nullifiers` usage with `get_block_range` spends.
-3. Update `SaplingRpcCapabilities` parsing: `canonical_witnesses`,
-   `consensus_anchors`, `hex_byte_order`, `index_status`,
-   `release_contract_ready`, revised `range_error_types`; drop
-   expectations of removed fields.
-4. Treat `index_incomplete`/`index_not_ready`/`backend_timeout` as
-   retryable; never advance `lastSyncedHeight` past them.
-5. Adapt `get_tree_state` field names; use `tree_size` +
-   `anchor` to bound/verify the local commitment tree.
-6. Ensure `server.version` is sent early; only the whitelisted probes
-   may precede it.
-7. Re-run the wallet's manual node test suite against the reference
-   node once synced, then update node-list readiness classification.
+## Witnesses (unchanged from July)
+
+Canonical Sapling witnesses (real `zcash_primitives` Pedersen tree,
+depth 32) validated fail-closed against consensus header-root anchors;
+`get_witness`/`get_witnesses` (batch ≤ 100); response includes
+`anchor`/`root`, `anchor_height`, `tree_size`,
+`position`/`global_position`, `cmu`, `txid`, `output_index`, 32 raw
+`path` nodes (`path_order: 'leaf_to_root'`).  Gate on
+`features.canonical_witnesses`; without the helper binary witness
+calls return `witness_backend_unavailable` and `get_best_anchor`
+returns `canonical_anchor_unavailable`.  Building the commitment tree
+locally from `get_block_range` positions remains the preferred primary
+path.  Sapling RPCs carry a ~8s server timeout surfaced as retryable
+`backend_timeout`.
+
+## Retryable error types (never advance sync state past them)
+
+`index_incomplete`, `index_not_ready`, `backend_timeout`,
+`mempool_not_ready`.
+
+## Wallet-side action list (delta since July handoff)
+
+1. Adopt `get_active_heights` for restore/catch-up scanning, gated on
+   `supports_active_height_index`.
+2. Gate the removal of the scan-behind-tip safety margin on
+   `features.consistent_db_height`.
+3. Add the mempool poll (and optionally subscribe) path, gated on
+   `supports_mempool` / `supports_mempool_subscribe`, for 0-conf
+   receive/send display; dedup mempool vs confirmed by txid + cmu.
+4. Treat `mempool_not_ready` as retryable alongside the existing
+   retryable set.

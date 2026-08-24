@@ -899,6 +899,7 @@ def test_sapling_capabilities_do_not_advertise_release_ready_without_witness_bac
         'canonical_witnesses': False,
         'consistent_db_height': True,
         'supports_mempool': True,
+        'supports_mempool_subscribe': True,
     }
     assert capabilities['hex_byte_order'] == 'display'
     assert capabilities['consensus_anchors'] is True
@@ -2772,3 +2773,126 @@ def test_capabilities_advertise_mempool(monkeypatch):
     assert 'blockchain.sapling.get_mempool' in capabilities['methods']
     assert capabilities['aliases']['blockchain.sapling.get_mempool'] == [
         'sapling.get_mempool']
+
+
+def test_mempool_subscribe_lifecycle_and_push():
+    '''Subscribe returns the snapshot; a set change pushes the full
+    envelope; no change pushes nothing; unsubscribe stops pushes.'''
+    _block, tx = _fixture_sapling_tx()
+    db = make_sapling_db()
+    db.db_height = 100
+    session = make_session(db, FixtureDaemon([]))
+    session.mempool = SimpleNamespace(txs={})
+    sent = []
+
+    async def send_notification(method, args):
+        sent.append((method, args))
+
+    session.send_notification = send_notification
+
+    result = run(session.sapling_mempool_subscribe())
+    assert result == {'txs': [], 'truncated': False}
+
+    # No change -> no push
+    run(session._sapling_mempool_maybe_notify())
+    assert sent == []
+
+    # Sapling tx enters the mempool -> full envelope pushed
+    session.mempool.txs[tx.txid] = _mempool_tx(tx)
+    run(session._sapling_mempool_maybe_notify())
+    assert len(sent) == 1
+    method, (snapshot,) = sent[0]
+    assert method == 'blockchain.sapling.mempool.subscribe'
+    assert [t['txid'] for t in snapshot['txs']] == [
+        hash_to_hex_str(tx.txid)]
+
+    # Same set -> no duplicate push
+    run(session._sapling_mempool_maybe_notify())
+    assert len(sent) == 1
+
+    # Tx mined/evicted -> empty envelope pushed
+    session.mempool.txs.clear()
+    run(session._sapling_mempool_maybe_notify())
+    assert len(sent) == 2
+    assert sent[1][1][0] == {'txs': [], 'truncated': False}
+
+    # Unsubscribe stops pushes
+    assert run(session.sapling_mempool_unsubscribe()) is True
+    session.mempool.txs[tx.txid] = _mempool_tx(tx)
+    run(session._sapling_mempool_maybe_notify())
+    assert len(sent) == 2
+    assert run(session.sapling_mempool_unsubscribe()) is False
+
+
+def test_mempool_subscribe_pushes_recovery_after_not_ready():
+    '''A not_ready push must be followed by a corrective push when the
+    index recovers, even if the tx set never changed.'''
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db([block])
+    db.db_height = block['height'] - 3
+    daemon = LaggingDaemon([block], cached_height=block['height'])
+    session = make_session(db, daemon)
+    session.mempool = SimpleNamespace(txs={})
+    sent = []
+
+    async def send_notification(method, args):
+        sent.append(args[0])
+
+    session.send_notification = send_notification
+
+    result = run(session.sapling_mempool_subscribe())
+    assert result['error']['type'] == 'mempool_not_ready'
+
+    # Index catches up; the set is unchanged but readiness flipped
+    db.db_height = block['height']
+    run(session._sapling_mempool_maybe_notify())
+    assert sent == [{'txs': [], 'truncated': False}]
+
+
+def test_capabilities_advertise_mempool_subscribe(monkeypatch):
+    monkeypatch.delenv(PIVX_SAPLING_WITNESS_HELPER_ENV, raising=False)
+    monkeypatch.setattr('electrumx.server.session.shutil.which',
+                        lambda _name: None)
+    block = load_block_fixture('pivx_mainnet_10000.json')
+    db = make_sapling_db([block])
+    session = make_session(db, FixtureDaemon([block]))
+
+    capabilities = run(session.sapling_capabilities())
+
+    assert capabilities['features']['supports_mempool_subscribe'] is True
+    assert 'blockchain.sapling.mempool.subscribe' in capabilities['methods']
+    assert capabilities['aliases'][
+        'blockchain.sapling.mempool.subscribe'] == [
+            'sapling.mempool.subscribe']
+
+
+def test_mempool_subscribe_retries_push_after_send_failure():
+    '''A failed send_notification must not record the key — the push is
+    retried on the next refresh wave instead of being swallowed.'''
+    _block, tx = _fixture_sapling_tx()
+    db = make_sapling_db()
+    db.db_height = 100
+    session = make_session(db, FixtureDaemon([]))
+    session.mempool = SimpleNamespace(txs={})
+    run(session.sapling_mempool_subscribe())
+
+    session.mempool.txs[tx.txid] = _mempool_tx(tx)
+    fail = {'on': True}
+    sent = []
+
+    async def send_notification(method, args):
+        if fail['on']:
+            raise ConnectionError('socket died')
+        sent.append(args[0])
+
+    session.send_notification = send_notification
+
+    with pytest.raises(ConnectionError):
+        run(session._sapling_mempool_maybe_notify())
+    assert sent == []
+
+    # Same key, next wave: retried and delivered
+    fail['on'] = False
+    run(session._sapling_mempool_maybe_notify())
+    assert len(sent) == 1
+    assert [t['txid'] for t in sent[0]['txs']] == [hash_to_hex_str(tx.txid)]
