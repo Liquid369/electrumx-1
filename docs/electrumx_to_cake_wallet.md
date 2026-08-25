@@ -99,11 +99,15 @@ per-height hashes against `block_hashes`).
    `latest_anchor` (display), `tree_size`, `commitment_count`,
    `anchor_first_height`, `block_hash`, `indexed_height`,
    `sapling_activation_height`; `nullifier_count` no longer exists.
-5. Version negotiation enforced with a pre-`server.version` whitelist
-   (all `blockchain.sapling.*`/`sapling.*` methods plus
-   `server.features`, `server.ping`, `server.banner`,
-   `get_capabilities`, `get_block_range`).  Send `server.version`
-   early.
+5. Request order is free: no method requires `server.version` first
+   (un-negotiated sessions run at the server's minimum protocol and
+   higher-protocol-only methods appear only after negotiation, so
+   still negotiate early as normal).  `server.version` is idempotent —
+   repeat it as a liveness check any number of times; it always
+   returns the negotiated result and never errors or drops the
+   session.  JSON-RPC ids are echoed verbatim (string in → string
+   out); drop any client-side id coercion.  `consistent_db_height` is
+   also mirrored inside `index_status` for convenience.
 
 ## Witnesses (unchanged from July)
 

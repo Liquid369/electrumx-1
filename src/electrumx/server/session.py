@@ -1593,31 +1593,48 @@ class ElectrumX(SessionBase):
         '''
         self.bump_cost(0.5)
         if self.sv_seen:
-            raise RPCError(BAD_REQUEST, f'server.version already sent')
+            # Idempotent: clients re-send server.version as a liveness
+            # check on an established session.  Answer with the
+            # already-negotiated result (repeat arguments are ignored;
+            # the first negotiation wins) and never error or disconnect.
+            await self.sv_negotiated.wait()
+            return electrumx.version, self.protocol_version_string()
         self.sv_seen = True
 
-        if client_name:
-            client_name = str(client_name)
-            if self.env.drop_client is not None and \
-                    self.env.drop_client.match(client_name):
+        try:
+            if client_name:
+                client_name = str(client_name)
+                if self.env.drop_client is not None and \
+                        self.env.drop_client.match(client_name):
+                    raise ReplyAndDisconnect(RPCError(
+                        BAD_REQUEST, f'unsupported client: {client_name}'))
+                self.client = client_name[:17]
+
+            # Find the highest common protocol version.  Disconnect if
+            # that protocol version in unsupported.
+            ptuple, client_min = util.protocol_version(
+                protocol_version, self.PROTOCOL_MIN, self.PROTOCOL_MAX)
+
+            await self.maybe_crash_old_client(
+                ptuple, self.env.coin.CRASH_CLIENT_VER)
+
+            if ptuple is None:
+                if client_min > self.PROTOCOL_MIN:
+                    self.logger.info(
+                        f'client requested future protocol version '
+                        f'{util.version_string(client_min)} '
+                        f'- is your software out of date?')
                 raise ReplyAndDisconnect(RPCError(
-                    BAD_REQUEST, f'unsupported client: {client_name}'))
-            self.client = client_name[:17]
-
-        # Find the highest common protocol version.  Disconnect if
-        # that protocol version in unsupported.
-        ptuple, client_min = util.protocol_version(
-            protocol_version, self.PROTOCOL_MIN, self.PROTOCOL_MAX)
-
-        await self.maybe_crash_old_client(ptuple, self.env.coin.CRASH_CLIENT_VER)
-
-        if ptuple is None:
-            if client_min > self.PROTOCOL_MIN:
-                self.logger.info(f'client requested future protocol version '
-                                 f'{util.version_string(client_min)} '
-                                 f'- is your software out of date?')
-            raise ReplyAndDisconnect(RPCError(
-                BAD_REQUEST, f'unsupported protocol version: {protocol_version}'))
+                    BAD_REQUEST,
+                    f'unsupported protocol version: {protocol_version}'))
+        except Exception:
+            # A failed negotiation must not leave the session
+            # half-negotiated (sv_seen set, event never set): the
+            # idempotent repeat path would wait on the event instead of
+            # failing fast, and a surviving session could never
+            # renegotiate
+            self.sv_seen = False
+            raise
         self.set_request_handlers(ptuple)
 
         self.sv_negotiated.set()
@@ -2312,18 +2329,12 @@ class PIVXSaplingElectrumX(ElectrumX):
                 self.transaction_get_sapling,
         })
 
-    # Cake Wallet probes Sapling capabilities and related methods
-    # before sending server.version; allow those (and harmless server
-    # info calls) pre-negotiation instead of disabling negotiation
-    # entirely for every client.
-    PRE_VERSION_EXTRA_METHODS = frozenset((
-        'server.features', 'server.ping', 'server.banner',
-        'get_capabilities', 'get_block_range',
-    ))
-
+    # The v1 contract does not require server.version as the first
+    # message: Cake Wallet probes capabilities pre-negotiation and its
+    # liveness checks assume order-independence.  Sessions that never
+    # negotiate are served with PROTOCOL_MIN handlers.
     def pre_version_method_allowed(self, method) -> bool:
-        return (self._is_sapling_method(method)
-                or method in self.PRE_VERSION_EXTRA_METHODS)
+        return True
 
     async def handle_request(self, request):
         if (isinstance(request, Request)
@@ -2516,6 +2527,8 @@ class PIVXSaplingElectrumX(ElectrumX):
             'lag': lag,
             'sapling_output_count': self.db.sapling_output_count,
             'retryable': not ready,
+            # db_height is a committed watermark (see features)
+            'consistent_db_height': True,
         }
 
     def _sapling_index_not_ready_error(self, requested_height=None):

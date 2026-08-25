@@ -1071,15 +1071,17 @@ def test_sapling_methods_are_allowed_before_server_version():
         Request('blockchain.sapling.capabilities', [])))
 
     assert response['version'] == 1
-    # Harmless server info probes are whitelisted too
+    # The v1 contract is request-order independent: everything is
+    # allowed before server.version
     for method in ('server.features', 'server.ping', 'server.banner',
-                   'get_capabilities', 'get_block_range'):
+                   'get_capabilities', 'get_block_range',
+                   'blockchain.headers.subscribe', 'anything.else'):
         assert session.pre_version_method_allowed(method) is True
-    assert session.pre_version_method_allowed(
-        'blockchain.headers.subscribe') is False
 
 
-def test_non_sapling_method_before_server_version_disconnects():
+def test_any_method_before_server_version_is_served():
+    '''No first-message requirement: a regular Electrum method before
+    server.version must be handled, never crash-probed/disconnected.'''
     session = make_session(make_sapling_db(), FixtureDaemon([]))
     session.set_request_handlers((1, 4))
     crash_attempts = []
@@ -1088,11 +1090,12 @@ def test_non_sapling_method_before_server_version_disconnects():
         crash_attempts.append(True)
 
     session._do_crash_old_electrum_client = fake_crash
+    assert session.sv_seen is False
 
-    with pytest.raises(ReplyAndDisconnect):
-        run(session.handle_request(
-            Request('blockchain.headers.subscribe', [])))
-    assert crash_attempts == [True]
+    response = run(session.handle_request(Request('server.ping', [])))
+
+    assert response is None  # server.ping's normal result
+    assert crash_attempts == []
 
 
 # ---------------------------------------------------------------------------
@@ -1142,6 +1145,7 @@ def test_sapling_capabilities_downgrade_when_index_is_behind_tip(
         'lag': 5,
         'sapling_output_count': 0,
         'retryable': True,
+        'consistent_db_height': True,
     }
 
 
@@ -2896,3 +2900,93 @@ def test_mempool_subscribe_retries_push_after_send_failure():
     run(session._sapling_mempool_maybe_notify())
     assert len(sent) == 1
     assert [t['txid'] for t in sent[0]['txs']] == [hash_to_hex_str(tx.txid)]
+
+
+# ---------------------------------------------------------------------------
+# Client-workaround removal guarantees (server.version, id echo,
+# consistent_db_height acceptance)
+# ---------------------------------------------------------------------------
+
+def test_server_version_is_idempotent_and_keeps_session():
+    '''Repeated server.version on a live session always returns the
+    negotiated result — never an error, never a disconnect.'''
+    session = make_session(make_sapling_db(), FixtureDaemon([]))
+    session.set_request_handlers((1, 4))
+    session.env = SimpleNamespace(drop_client=None, coin=Pivx)
+    session.client = 'unknown'
+
+    first = run(session.server_version('cake-wallet/1.0', '1.4'))
+    assert first[1]  # negotiated protocol string
+    assert session.sv_seen is True
+
+    # Liveness checks: same call again (and with different args) must
+    # return the same result and leave the session alive
+    for args in (('cake-wallet/1.0', '1.4'), ('other/2.0', '1.4'), ()):
+        assert run(session.server_version(*args)) == first
+    # And regular requests still work afterwards
+    response = run(session.handle_request(
+        Request('blockchain.sapling.capabilities', [])))
+    assert response['version'] == 1
+
+
+def test_jsonrpc_id_is_echoed_verbatim():
+    '''A string request id comes back as a string (and an int as an
+    int) — byte-level, through the same JSON-RPC layer sessions use.'''
+    from aiorpcx.jsonrpc import JSONRPCv2
+
+    for raw_id, encoded in (('abc-123', b'"abc-123"'), (7, b'7')):
+        message = JSONRPCv2.response_message('pong', raw_id)
+        payload = json.loads(message)
+        assert payload['id'] == raw_id
+        assert encoded in message
+        # And a parsed request preserves the id type end-to-end
+        request_msg = JSONRPCv2.request_message(
+            Request('server.ping', []), raw_id)
+        _item, request_id = JSONRPCv2.message_to_item(request_msg)
+        assert request_id == raw_id
+        assert type(request_id) is type(raw_id)
+
+
+def test_get_block_range_at_reported_db_height_is_never_empty():
+    '''Acceptance for consistent_db_height: a block with Sapling
+    outputs at the freshly-reported db_height is served with its data;
+    heights not yet covered error retryably instead of reading empty.'''
+    block = load_block_fixture('pivx_mainnet_5057529.json')
+    db = make_sapling_db([block])
+    index_block_sapling(db, block)
+    session = make_session(db, FixtureDaemon([block]))
+
+    status = session._sapling_index_status()
+    assert status['consistent_db_height'] is True
+    assert status['db_height'] == block['height']
+
+    response = run(session.sapling_get_block_range(
+        status['db_height'], status['db_height']))
+    assert response['success'] is True
+    assert response['empty'] is False
+    assert response['blocks'][0]['outputs']  # the Sapling data is there
+
+    # One above the watermark: retryable error, never a silent empty
+    above = run(session.sapling_get_block_range(
+        status['db_height'] + 1, status['db_height'] + 1))
+    assert above['success'] is False
+    assert above['error']['type'] == 'index_incomplete'
+
+
+def test_failed_negotiation_resets_state_for_a_clean_retry():
+    '''A rejected first server.version (unsupported protocol) must not
+    leave the session half-negotiated: a later server.version starts a
+    fresh negotiation instead of waiting on an event that never sets.'''
+    session = make_session(make_sapling_db(), FixtureDaemon([]))
+    session.set_request_handlers((1, 4))
+    session.env = SimpleNamespace(drop_client=None, coin=Pivx)
+    session.client = 'unknown'
+
+    with pytest.raises(ReplyAndDisconnect):
+        run(session.server_version('old-client/0.1', '0.9'))
+    assert session.sv_seen is False
+    assert not session.sv_negotiated.is_set()
+
+    result = run(session.server_version('cake-wallet/1.0', '1.4'))
+    assert result[1]
+    assert session.sv_negotiated.is_set()

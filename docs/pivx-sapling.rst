@@ -157,7 +157,8 @@ Sapling sync/send routes.  A production-ready server returns (abridged):
        "daemon_height": 5057600,
        "lag": 0,
        "sapling_output_count": 12345,
-       "retryable": false
+       "retryable": false,
+       "consistent_db_height": true
      }
    }
 
@@ -1209,19 +1210,22 @@ No Shielded Balance Showing
 3. **Check method names**: Use exact method names (``blockchain.sapling.get_block_range``)
 4. **Test connection**: Verify server is responding to Sapling methods
 
-Connection Refused / "use server.version to identify client"
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+server.version Semantics
+~~~~~~~~~~~~~~~~~~~~~~~~
 
-Standard ElectrumX version negotiation applies: ``server.version`` must
-be the first message on a session.  PIVX Sapling sessions whitelist a
-narrow exception for Cake Wallet's pre-negotiation probing:
-Sapling-prefixed methods (``blockchain.sapling.*``, ``sapling.*``,
-``blockchain.nullifier.*``, ``blockchain.commitment.*``,
-``blockchain.anchor.*``) plus ``server.features``, ``server.ping``,
-``server.banner``, ``get_capabilities``, and ``get_block_range`` may be
-called before negotiation.  Calling any other method first closes the
-connection with ``use server.version to identify client`` -- send
-``server.version`` before regular Electrum methods.
+PIVX Sapling sessions are request-order independent: no method requires
+``server.version`` to have been sent first.  Sessions that never
+negotiate are served at the server's minimum protocol version --
+methods that only exist at higher protocol versions register only
+after negotiating them, and the operator's ``DROP_CLIENT`` filter can
+only apply once a client identifies -- so clients should still
+negotiate early as usual.  ``server.version`` is
+**idempotent**: repeated calls on a live session -- e.g. periodic
+liveness checks -- always return the already-negotiated
+``[server_version, protocol_version]`` result; repeat arguments are
+ignored (the first negotiation wins) and the call never errors or
+drops the connection.  JSON-RPC request ids are echoed verbatim with
+their original type (a string id returns a string id).
 
 Empty Results
 ~~~~~~~~~~~~
