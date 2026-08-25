@@ -23,7 +23,16 @@ class PaddedRSTransport(RSTransport):
     """
 
     MIN_PACKET_SIZE = 1024
-    WAIT_FOR_BUFFER_GROWTH_SECONDS = 1.0
+    # Coalescing window before a below-MIN_PACKET_SIZE payload is padded
+    # and flushed anyway.  Upstream used 1.0s, which is invisible to a
+    # pipelining client (Electrum fills the buffer past MIN_PACKET_SIZE
+    # and flushes instantly) but turns serial request-response clients
+    # (Cake Wallet fetches per address and waits for each reply) into
+    # 1 request/second: after the warmup budget, EVERY small response
+    # sat a full second in the buffer.  Diagnosed live as wallets
+    # flapping "offline"; 50ms still coalesces same-burst writes while
+    # being far below any client timeout.
+    WAIT_FOR_BUFFER_GROWTH_SECONDS = 0.05
     # amount of (unpadded) bytes sent instantly before beginning with polling.
     # This makes the initial handshake where a few small messages are exchanged faster.
     WARMUP_BUDGET_SIZE = 1024
