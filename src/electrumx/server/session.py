@@ -2336,7 +2336,32 @@ class PIVXSaplingElectrumX(ElectrumX):
     def pre_version_method_allowed(self, method) -> bool:
         return True
 
+    # Diagnostic request tracing (set PIVX_TRACE_REQUESTS=1): logs the
+    # wall-clock of every byte arrival, dispatch, and completion so the
+    # latency between socket and handler is directly visible in the
+    # journal.  Off by default — per-request INFO logging is loud.
+    _pivx_trace = bool(os.environ.get('PIVX_TRACE_REQUESTS'))
+
+    def data_received(self, data):
+        if self._pivx_trace:
+            self.logger.info(
+                f'trace recv {len(data)}B t={time.time():.3f}')
+        super().data_received(data)
+
     async def handle_request(self, request):
+        if self._pivx_trace:
+            method = getattr(request, 'method', '?')
+            t0 = time.time()
+            self.logger.info(f'trace dispatch {method} t={t0:.3f}')
+            try:
+                return await self._pivx_handle_request(request)
+            finally:
+                self.logger.info(
+                    f'trace done {method} t={time.time():.3f} '
+                    f'handler={time.time() - t0:.3f}s')
+        return await self._pivx_handle_request(request)
+
+    async def _pivx_handle_request(self, request):
         if (isinstance(request, Request)
                 and self._is_sapling_method(request.method)
                 and request.method not in self.request_handlers):
