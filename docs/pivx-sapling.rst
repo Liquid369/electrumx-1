@@ -1138,6 +1138,35 @@ Example: Cake Wallet Integration
                    if spend['nullifier'] in self.our_nullifiers:
                        self.mark_spent(spend['nullifier'])
 
+Operator Notes: Request Throttling
+----------------------------------
+
+ElectrumX's session cost limiter (``COST_SOFT_LIMIT`` /
+``COST_HARD_LIMIT`` / ``REQUEST_SLEEP`` environment settings) must be
+sized for wallet refresh *bursts*: the PIVX client fetches balances
+per address plus several Sapling calls per refresh, so one refresh is
+tens of requests, not one.  Past the soft limit every request sleeps
+``cost_fraction * REQUEST_SLEEP`` — with tight limits a refreshing
+wallet degrades to ~1 request/second and its keep-alive times out,
+which the user sees as the node flapping offline.  Two couplings are
+easy to miss: per-session cost decay and the dead-session group-cost
+refund both scale with ``COST_HARD_LIMIT`` (``hard/10000`` and
+``hard/5000`` per second respectively), so a low hard limit also means
+slow recovery and a reconnect spiral (each reconnect inherits retained
+group cost); and every JSON-RPC *error* costs 100 points, so noisy
+clients burn budget fast.
+
+Recommended for public wallet-facing nodes::
+
+    COST_SOFT_LIMIT=10000
+    COST_HARD_LIMIT=100000
+    REQUEST_SLEEP=1000
+
+A full refresh burst (~50-200 cost) then never throttles, session
+decay is ~10/sec, and genuine abuse still ramps to 1s/request sleeps
+and disconnects at the hard limit.  Verify at startup: the log prints
+``session cost hard limit`` / ``soft limit``.
+
 Testing
 -------
 
