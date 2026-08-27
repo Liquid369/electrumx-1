@@ -1138,6 +1138,19 @@ Example: Cake Wallet Integration
                    if spend['nullifier'] in self.our_nullifiers:
                        self.mark_spent(spend['nullifier'])
 
+Operator Notes: Periodic History Compaction
+-------------------------------------------
+
+ElectrumX's history flush counter is a uint16 with a hard ceiling of
+65,535; once caught up the server flushes once per block (~1,440/day
+at PIVX's 60s cadence), so the counter lasts about 45 days before the
+server crashes at flush time with ``struct.error: 'H' format requires
+0 <= number <= 65535``.  Run the bundled ``electrumx_compact_history``
+(service stopped) before that — a monthly systemd timer driving
+``contrib/operations/electrumx-compact.sh`` is provided; stagger the
+schedule across nodes so at least one stays serving during the
+~15-45 minute compaction window.
+
 Operator Notes: Request Throttling
 ----------------------------------
 
