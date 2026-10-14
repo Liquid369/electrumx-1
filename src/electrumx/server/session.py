@@ -55,6 +55,18 @@ PIVX_SAPLING_MAX_BLOCK_RANGE = 100
 PIVX_SAPLING_ACTIVE_HEIGHTS_MAX_LIMIT = 50000
 PIVX_SAPLING_MEMPOOL_MAX_TXS = 1000
 PIVX_SAPLING_MEMPOOL_MAX_OUTPUTS = 10000
+# Sapling output and spend records are fixed-width (enc_ciphertext 580,
+# out_ciphertext 80, four or five 32-byte fields), so a record count is an
+# accurate proxy for serialized size and needs no trial json.dumps.
+# Hex-encoded with JSON keys, measured on mainnet 5057529.
+PIVX_SAPLING_RANGE_BYTES_PER_OUTPUT = 6000
+PIVX_SAPLING_RANGE_BYTES_PER_OUTPUT_SLIM = 1400
+# Leaves headroom for the envelope and block_hashes, which scale with the
+# height count rather than the output count.
+PIVX_SAPLING_RANGE_SIZE_BUDGET_FRACTION = 0.75
+# Only used when env is unavailable. Matches the deployed max_send on
+# electrum01/02; the env value wins whenever there is one.
+PIVX_SAPLING_RANGE_MAX_SEND = 2_000_000
 PIVX_SAPLING_RPC_CONTRACT = 'pivx.sapling.electrumx.v1'
 PIVX_SAPLING_RELEASE_METHODS = [
     'blockchain.sapling.get_block_range',
@@ -2872,15 +2884,22 @@ class PIVXSaplingElectrumX(ElectrumX):
     @staticmethod
     def _sapling_range_response(start_height, end_height, blocks, complete,
                                 error=None, total_sapling_txs=0,
-                                block_hashes=None):
+                                block_hashes=None, truncated=False,
+                                next_height=None):
         height_count = (
             end_height - start_height + 1
             if isinstance(start_height, int) and isinstance(end_height, int)
             and end_height >= start_height else 0
         )
+        # A size-truncated reply is a success with a resume cursor, not a
+        # failure: without it the same request died at the transport with
+        # -32600 response too large. Every other caller passes truncated
+        # False, so v1 success semantics are unchanged for them.
         return {
-            'success': complete and error is None,
+            'success': (complete or truncated) and error is None,
             'complete': complete,
+            'truncated': truncated,
+            'next_height': next_height,
             'empty': complete and total_sapling_txs == 0,
             'contract': PIVX_SAPLING_RPC_CONTRACT,
             'start_height': start_height,
@@ -3242,7 +3261,8 @@ class PIVXSaplingElectrumX(ElectrumX):
     async def sapling_get_block_range(
             self,
             start_height: int,
-            end_height: int
+            end_height: int,
+            slim: bool = False
     ):
         '''Get compact block data for a height range (Zcash lightwalletd compatible).
 
@@ -3254,10 +3274,24 @@ class PIVXSaplingElectrumX(ElectrumX):
 
         start_height: starting block height (inclusive)
         end_height: ending block height (inclusive)
+        slim: emit only the fields a trial-decrypting client reads, and omit the
+            block-level ``outputs`` mirror of ``txs[].outputs``. Opt-in, because
+            the default shape is the published v1 contract. Measured on
+            electrum02 at 5407501: default is ~6.0 kB per output on the wire,
+            slim is ~1.4 kB, so 50 blocks stops tripping the 2,000,000-byte cap.
+            Two thirds of that saving is the dropped mirror, not the dropped
+            fields: every output dict is serialized twice in the default shape.
 
-        Returns a v1 response envelope. ``success`` and ``complete`` are only
-        true when every requested height was scanned. ``block_hashes`` contains
-        every scanned height, including heights with no Sapling transactions.
+        Returns a v1 response envelope. ``complete`` is only true when every
+        requested height was scanned. ``block_hashes`` contains every scanned
+        height, including heights with no Sapling transactions.
+
+        A reply that would exceed the transport limit is cut on a block
+        boundary and returns ``success`` true with ``complete`` false,
+        ``truncated`` true and ``next_height`` set to the first unscanned
+        height. Resume from ``next_height``. Before this the same request
+        failed at the transport with -32600, so a client that only checks
+        ``complete`` is no worse off than it was.
         '''
         from electrumx.lib.tx import TxPIVXSapling
 
@@ -3297,6 +3331,15 @@ class PIVXSaplingElectrumX(ElectrumX):
         blocks = []
         block_hash_items = []
         total_sapling_txs = 0
+        bytes_per_output = (PIVX_SAPLING_RANGE_BYTES_PER_OUTPUT_SLIM if slim
+                            else PIVX_SAPLING_RANGE_BYTES_PER_OUTPUT)
+        # env is absent on the lighter session objects the tests build, same
+        # as the mempool lookups above.
+        env = getattr(self, 'env', None)
+        max_send = getattr(env, 'max_send', None) or PIVX_SAPLING_RANGE_MAX_SEND
+        size_budget = int(max_send * PIVX_SAPLING_RANGE_SIZE_BUDGET_FRACTION)
+        emitted_outputs = 0
+        truncated_at = None
 
         try:
             # The indexed chain is canonical: take hashes from our own
@@ -3401,23 +3444,40 @@ class PIVXSaplingElectrumX(ElectrumX):
                             # natural-order byte vectors
                             epk_hex = self._sapling_raw_to_display(
                                 output.ephemeral_key)
-                            output_data = {
-                                'position': position,
-                                'global_position': position,
-                                'txid': txid_hex,
-                                'tx_index': tx_index,
-                                'output_index': output_index,
-                                'cmu': self._sapling_raw_to_display(
-                                    output.cmu),
-                                'epk': epk_hex,
-                                'ephemeral_key': epk_hex,
-                                'ciphertext': output.enc_ciphertext.hex(),
-                                'enc_ciphertext': output.enc_ciphertext.hex(),
-                                'cv': self._sapling_raw_to_display(output.cv),
-                                'out_ciphertext': output.out_ciphertext.hex(),
-                            }
+                            if slim:
+                                output_data = {
+                                    'global_position': position,
+                                    'tx_index': tx_index,
+                                    'output_index': output_index,
+                                    'cmu': self._sapling_raw_to_display(
+                                        output.cmu),
+                                    'epk': epk_hex,
+                                    'ciphertext':
+                                        output.enc_ciphertext.hex(),
+                                }
+                            else:
+                                output_data = {
+                                    'position': position,
+                                    'global_position': position,
+                                    'txid': txid_hex,
+                                    'tx_index': tx_index,
+                                    'output_index': output_index,
+                                    'cmu': self._sapling_raw_to_display(
+                                        output.cmu),
+                                    'epk': epk_hex,
+                                    'ephemeral_key': epk_hex,
+                                    'ciphertext':
+                                        output.enc_ciphertext.hex(),
+                                    'enc_ciphertext':
+                                        output.enc_ciphertext.hex(),
+                                    'cv': self._sapling_raw_to_display(
+                                        output.cv),
+                                    'out_ciphertext':
+                                        output.out_ciphertext.hex(),
+                                }
                             compact_outputs.append(output_data)
-                            block_outputs.append(output_data)
+                            if not slim:
+                                block_outputs.append(output_data)
 
                         # Compact spends/nullifiers (for sync)
                         compact_spends = []
@@ -3438,14 +3498,31 @@ class PIVXSaplingElectrumX(ElectrumX):
                             'spends': compact_spends,
                         })
 
-                blocks.append({
+                block_outputs_count = sum(len(tx['outputs'])
+                                          for tx in compact_txs)
+                # Stop on a block boundary, because the client resumes by
+                # height and a half-emitted block has no cursor. Always emit
+                # the first block even when it alone busts the budget, or a
+                # single fat block would stall the sync with no way forward.
+                if (blocks and (emitted_outputs + block_outputs_count)
+                        * bytes_per_output > size_budget):
+                    truncated_at = height
+                    break
+                emitted_outputs += block_outputs_count
+
+                block_data = {
                     'height': height,
                     'hash': block_hash,
                     'block_hash': block_hash,
                     'time': block_time,
-                    'outputs': block_outputs,
                     'txs': compact_txs,
-                })
+                }
+                if not slim:
+                    # Omitted rather than emptied under slim: an empty list
+                    # reads as "block has no outputs", which is a wrong answer.
+                    # A missing key makes a stale consumer fail loudly.
+                    block_data['outputs'] = block_outputs
+                blocks.append(block_data)
                 total_sapling_txs += len(compact_txs)
 
         except DaemonError as e:
@@ -3469,6 +3546,17 @@ class PIVXSaplingElectrumX(ElectrumX):
                 start_height, end_height, blocks, False,
                 {'type': 'server_error', 'message': str(e)},
                 total_sapling_txs, block_hash_items)
+
+        if truncated_at is not None:
+            # block_hashes is documented as every scanned height, so it has to
+            # shrink with the block list or the client sees hashes for heights
+            # it got no block for.
+            return self._sapling_range_response(
+                start_height, end_height, blocks, False, None,
+                total_sapling_txs,
+                [item for item in block_hash_items
+                 if item['height'] < truncated_at],
+                truncated=True, next_height=truncated_at)
 
         return self._sapling_range_response(
             start_height, end_height, blocks, True, None,
