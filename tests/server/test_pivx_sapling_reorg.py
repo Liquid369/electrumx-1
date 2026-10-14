@@ -2990,3 +2990,142 @@ def test_failed_negotiation_resets_state_for_a_clean_retry():
     result = run(session.server_version('cake-wallet/1.0', '1.4'))
     assert result[1]
     assert session.sv_negotiated.is_set()
+
+
+def test_get_block_range_slim_keeps_what_a_decrypting_client_reads():
+    block = load_block_fixture('pivx_mainnet_5057529.json')
+    db = make_sapling_db([block])
+    index_block_sapling(db, block)
+    session = make_session(db, FixtureDaemon([block]))
+
+    full = run(session.sapling_get_block_range(
+        block['height'], block['height']))
+    slim = run(session.sapling_get_block_range(
+        block['height'], block['height'], slim=True))
+
+    assert full['success'] is slim['success'] is True
+    full_block, slim_block = full['blocks'][0], slim['blocks'][0]
+    full_out = full_block['txs'][0]['outputs'][0]
+    slim_out = slim_block['txs'][0]['outputs'][0]
+
+    # Trial decryption needs exactly these; values must not drift from v1.
+    for field in ('cmu', 'epk', 'ciphertext', 'global_position',
+                  'tx_index', 'output_index'):
+        assert slim_out[field] == full_out[field]
+
+    assert not {'position', 'txid', 'ephemeral_key', 'enc_ciphertext', 'cv',
+                'out_ciphertext'} & set(slim_out)
+    # txid stays reachable at tx level, so dropping it per-output is lossless
+    assert slim_block['txs'][0]['txid'] == full_block['txs'][0]['txid']
+    assert slim_block['txs'][0]['spends'] == full_block['txs'][0]['spends']
+
+    # The block-level mirror of txs[].outputs is absent, not empty: an empty
+    # list would read as "no outputs in this block".
+    assert 'outputs' in full_block and 'outputs' not in slim_block
+
+    assert (len(json.dumps(slim_block))
+            < len(json.dumps(full_block)) / 3)
+
+
+def _three_block_range():
+    '''The same Sapling fixture served at three consecutive heights, so a
+    range can be truncated. Distinct hashes because the fake daemon keys on
+    them; the raw bytes are shared, which is fine because truncation cares
+    about block and output counts, not about distinct commitments.'''
+    base = load_block_fixture('pivx_mainnet_5057529.json')
+    blocks = []
+    for offset in range(3):
+        block = dict(base)
+        block['height'] = base['height'] + offset
+        block['hash'] = f'{offset + 1:02x}' * 32
+        blocks.append(block)
+    db = make_sapling_db(blocks)
+    for offset, block in enumerate(blocks):
+        index_block_sapling(db, block, position_start=offset * 2)
+    return blocks, db, make_session(db, FixtureDaemon(blocks))
+
+
+def test_get_block_range_truncates_on_a_block_boundary_with_a_cursor():
+    blocks, _db, session = _three_block_range()
+    start, end = blocks[0]['height'], blocks[2]['height']
+    # Far below one block's worth of outputs, so the budget trips immediately.
+    session.env = SimpleNamespace(max_send=10_000)
+
+    response = run(session.sapling_get_block_range(start, end))
+
+    # Truncation is a success with a cursor, not a failure: the alternative
+    # is the transport killing the whole reply with -32600.
+    assert response['success'] is True
+    assert response['complete'] is False
+    assert response['truncated'] is True
+    assert response['next_height'] == start + 1
+    assert [block['height'] for block in response['blocks']] == [start]
+    # block_hashes is documented as every SCANNED height, so it must shrink
+    # with the block list rather than echo the whole request.
+    assert [item['height'] for item in response['block_hashes']] == [start]
+    assert response['start_height'] == start
+    assert response['end_height'] == end
+
+
+def test_get_block_range_resumes_from_next_height_without_gaps():
+    blocks, _db, session = _three_block_range()
+    start, end = blocks[0]['height'], blocks[2]['height']
+    session.env = SimpleNamespace(max_send=10_000)
+
+    seen = []
+    height = start
+    for _ in range(len(blocks) + 1):
+        response = run(session.sapling_get_block_range(height, end))
+        assert response['success'] is True
+        seen.extend(block['height'] for block in response['blocks'])
+        if not response['truncated']:
+            break
+        # Must advance, or a client loops forever on a fat block.
+        assert response['next_height'] > height
+        height = response['next_height']
+    else:
+        raise AssertionError('range never completed')
+
+    assert seen == [block['height'] for block in blocks]
+
+
+def test_get_block_range_always_emits_one_block_even_if_it_busts_the_budget():
+    blocks, _db, session = _three_block_range()
+    session.env = SimpleNamespace(max_send=1)
+
+    response = run(session.sapling_get_block_range(
+        blocks[0]['height'], blocks[2]['height']))
+
+    # Zero blocks would strand the client with no way to make progress.
+    assert len(response['blocks']) == 1
+    assert response['truncated'] is True
+    assert response['next_height'] == blocks[0]['height'] + 1
+
+
+def test_get_block_range_under_budget_is_complete_and_not_truncated():
+    blocks, _db, session = _three_block_range()
+    session.env = SimpleNamespace(max_send=2_000_000)
+
+    response = run(session.sapling_get_block_range(
+        blocks[0]['height'], blocks[2]['height']))
+
+    assert response['success'] is True
+    assert response['complete'] is True
+    assert response['truncated'] is False
+    assert response['next_height'] is None
+    assert len(response['blocks']) == 3
+
+
+def test_get_block_range_slim_fits_more_blocks_per_budget_than_full():
+    blocks, _db, session = _three_block_range()
+    start, end = blocks[0]['height'], blocks[2]['height']
+    # Sized so the full shape truncates and the slim shape does not, which is
+    # the whole point of the slim flag for a sync client.
+    session.env = SimpleNamespace(max_send=20_000)
+
+    full = run(session.sapling_get_block_range(start, end))
+    slim = run(session.sapling_get_block_range(start, end, slim=True))
+
+    assert full['truncated'] is True
+    assert slim['truncated'] is False
+    assert len(slim['blocks']) > len(full['blocks'])
